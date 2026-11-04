@@ -1,0 +1,45 @@
+cd /d "D:\Projects"
+
+set "P=MRFP_Segregated_Extractor_Canada_HTML_v1"
+
+:: CREATE FOLDERS
+mkdir "%P%"
+mkdir "%P%\css"
+mkdir "%P%\Assets"
+mkdir "%P%\vendor\pdfjs"
+mkdir "%P%\js"
+mkdir "%P%\js\core"
+mkdir "%P%\js\fmc"
+mkdir "%P%\dev-tools"
+mkdir "%P%\tests\fixtures\ci"
+
+:: MAIN APPLICATION
+for %F in (index.html README.md) do @if not exist "%P%\%F" type nul > "%P%\%F"
+
+:: CSS
+if not exist "%P%\css\style.css" type nul > "%P%\css\style.css"
+
+:: APPLICATION MODULES
+for %F in (app pdf-reader evidence-viewer storage excel-export engine evidence-locator) do @if not exist "%P%\js\%F.js" type nul > "%P%\js\%F.js"
+
+:: SHARED CORE
+for %F in (document-indexer fund-segmenter extraction-engine evidence-engine fmc-registry shared-utils) do @if not exist "%P%\js\core\%F.js" type nul > "%P%\js\core\%F.js"
+
+:: FMC ADAPTERS - 33 SKELETON FILES
+for %F in (agf blackrock bmg bmo brandes ci cibc desjardins dynamic fidelity first-trust franklin-templeton global-x hamilton harvest ig-mackenzie leith-wheeler lysander mackenzie manulife middlefield nbi nei newgen ninepoint pender purpose rbc rpia scotia sun-life td vanguard) do @if not exist "%P%\js\fmc\%F.js" type nul > "%P%\js\fmc\%F.js"
+
+:: FMC ADAPTER TEMPLATE
+if not exist "%P%\js\fmc\ADAPTER_TEMPLATE.txt" type nul > "%P%\js\fmc\ADAPTER_TEMPLATE.txt"
+
+:: DEVELOPMENT TOOLS
+if not exist "%P%\dev-tools\build.cjs" type nul > "%P%\dev-tools\build.cjs"
+if not exist "%P%\dev-tools\fmc-manifest.json" type nul > "%P%\dev-tools\fmc-manifest.json"
+
+:: REGRESSION TESTS
+if not exist "%P%\tests\ci-regression.cjs" type nul > "%P%\tests\ci-regression.cjs"
+if not exist "%P%\tests\adapter-isolation.cjs" type nul > "%P%\tests\adapter-isolation.cjs"
+
+:: VERIFY STRUCTURE
+echo.
+echo SKELETON BUILD COMPLETE
+tree "%P%" /F
