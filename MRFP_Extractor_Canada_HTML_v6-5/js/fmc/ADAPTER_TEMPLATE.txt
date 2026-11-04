@@ -1,0 +1,39 @@
+/* Example only. Rename to a NEW key.js; do not register this text file. */
+// @mrfp:profile
+const profile_new_key={key:'new_key',label:'Manager',style:'new_key',signatures:[/Unique legal issuer name/i],title:/^(Manager .* Fund)$/im};
+// Optional adapter-owned identity and parsing preferences; keep defaults
+// absent unless the issuer actually requires different behavior.
+// const fmcConfig_new_key={issuerPrefix:/^Manager\s/i,titleScanPages:3,
+//   preferProfileLineTitle:false, splitColumns:false, deduplicate:false,
+//   renameEmptyClasses:false, allowRowFallback:true};
+// @mrfp:extraction
+function extract_new_key(pages,profile,fund,date){
+  // Implement source-validated Class/Series current period MER, TER, PTR.
+  // Never guess a missing ratio. Unknown layout => [] for manual review.
+  return [];
+}
+// Optional hooks supported by dev-tools/build.cjs:
+// function identifyFundEarly_new_key(pages,profile,head){ /* prefer verified product title, otherwise undefined */ }
+// function identifyFundLate_new_key(pages,profile,head){ return undefined; }
+// function identifyFundFallback_new_key(pages,profile,head){ return undefined; }
+// function classHeading_new_key(line){ return null; }
+// function selectReportDate_new_key(pages){ return reportDate(pages); }
+// function auditRatioHeadings_new_key(pageText,potential){ /* add Class/Series names */ }
+// @mrfp:evidence
+// Optional: add a source-evidence version stamp when a NEW locator strategy is
+// introduced. Increment the version when old saved cells must be revalidated.
+// The builder will automatically register this policy with the central locator.
+// const evidencePolicy_new_key={stamps:{newKeyLocatorVersion:1}};
+function locateCell_new_key(page,lines,row,key,value,context){
+  // Returning null fails closed. Validate fund, class, date, labels,
+  // exact original ratio cell and coordinates before returning a box.
+  return null;
+}
+
+// Optional FMC-specific evidence layout settings:
+// const evidenceLayout_new_key={newBatch:true};
+// function validateDocumentEvidence_new_key(pages,row){return true;}
+// function validateAnnualEtfRow_new_key(page,row){return true;}
+// function ratioHeader_new_key(lines,rowY){return null;}
+// After changing a file, rebuild both classic browser bundles and run
+// all regression tests; never directly modify js/engine.js or evidence-locator.js.

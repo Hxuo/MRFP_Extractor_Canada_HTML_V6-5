@@ -1,0 +1,200 @@
+[
+  {
+    "key": "nbi",
+    "profile": "nbi",
+    "extract": "extract_nbi",
+    "file": "js/fmc/nbi.js"
+  },
+  {
+    "key": "desjardins",
+    "profile": "desjardins",
+    "extract": "extract_desjardins",
+    "file": "js/fmc/desjardins.js"
+  },
+  {
+    "key": "sun_life",
+    "profile": "sunLife",
+    "extract": "extract_sun_life",
+    "file": "js/fmc/sun_life.js"
+  },
+  {
+    "key": "franklin",
+    "profile": "franklin",
+    "extract": "extract_franklin",
+    "file": "js/fmc/franklin.js"
+  },
+  {
+    "key": "middlefield",
+    "profile": "middlefield",
+    "extract": "extract_middlefield",
+    "file": "js/fmc/middlefield.js"
+  },
+  {
+    "key": "manulife",
+    "profile": "manulife",
+    "extract": "extract_manulife",
+    "file": "js/fmc/manulife.js"
+  },
+  {
+    "key": "dynamic",
+    "profile": "dynamic",
+    "extract": "extract_dynamic",
+    "file": "js/fmc/dynamic.js"
+  },
+  {
+    "key": "purpose",
+    "profile": "purpose",
+    "extract": "extract_purpose",
+    "file": "js/fmc/purpose.js"
+  },
+  {
+    "key": "blackrock",
+    "profile": "blackrock",
+    "extract": "extract_blackrock",
+    "file": "js/fmc/blackrock.js"
+  },
+  {
+    "key": "rbc",
+    "profile": "rbc",
+    "extract": "extract_rbc",
+    "file": "js/fmc/rbc.js"
+  },
+  {
+    "key": "bmo",
+    "profile": "bmo",
+    "extract": "extract_bmo",
+    "file": "js/fmc/bmo.js"
+  },
+  {
+    "key": "bmg",
+    "profile": "bmg",
+    "extract": "extract_bmg",
+    "file": "js/fmc/bmg.js"
+  },
+  {
+    "key": "first_trust",
+    "profile": "firstTrust",
+    "extract": "extract_first_trust",
+    "file": "js/fmc/first_trust.js"
+  },
+  {
+    "key": "td",
+    "profile": "profile_td",
+    "extract": "extract_td",
+    "file": "js/fmc/td.js"
+  },
+  {
+    "key": "lysander",
+    "profile": "profile_lysander",
+    "extract": "extract_lysander",
+    "file": "js/fmc/lysander.js"
+  },
+  {
+    "key": "nei",
+    "profile": "profile_nei",
+    "extract": "extract_nei",
+    "file": "js/fmc/nei.js"
+  },
+  {
+    "key": "mackenzie",
+    "profile": "profile_mackenzie",
+    "extract": "extract_mackenzie",
+    "file": "js/fmc/mackenzie.js"
+  },
+  {
+    "key": "ig_mackenzie",
+    "profile": "profile_ig_mackenzie",
+    "extract": "extract_ig_mackenzie",
+    "file": "js/fmc/ig_mackenzie.js"
+  },
+  {
+    "key": "fidelity",
+    "profile": "profile_fidelity",
+    "extract": "extract_fidelity",
+    "file": "js/fmc/fidelity.js"
+  },
+  {
+    "key": "pender",
+    "profile": "profile_pender",
+    "extract": "extract_pender",
+    "file": "js/fmc/pender.js"
+  },
+  {
+    "key": "brandes",
+    "profile": "profile_brandes",
+    "extract": "extract_brandes",
+    "file": "js/fmc/brandes.js"
+  },
+  {
+    "key": "agf",
+    "profile": "profile_agf",
+    "extract": "extract_agf",
+    "file": "js/fmc/agf.js"
+  },
+  {
+    "key": "harvest",
+    "profile": "profile_harvest",
+    "extract": "extract_harvest",
+    "file": "js/fmc/harvest.js"
+  },
+  {
+    "key": "vanguard",
+    "profile": "profile_vanguard",
+    "extract": "extract_vanguard",
+    "file": "js/fmc/vanguard.js"
+  },
+  {
+    "key": "ninepoint",
+    "profile": "profile_ninepoint",
+    "extract": "extract_ninepoint",
+    "file": "js/fmc/ninepoint.js"
+  },
+  {
+    "key": "global_x",
+    "profile": "profile_global_x",
+    "extract": "extract_global_x",
+    "file": "js/fmc/global_x.js"
+  },
+  {
+    "key": "cibc",
+    "profile": "profile_cibc",
+    "extract": "extract_cibc",
+    "file": "js/fmc/cibc.js"
+  },
+  {
+    "key": "hamilton",
+    "profile": "profile_hamilton",
+    "extract": "extract_hamilton",
+    "file": "js/fmc/hamilton.js"
+  },
+  {
+    "key": "newgen",
+    "profile": "profile_newgen",
+    "extract": "extract_newgen",
+    "file": "js/fmc/newgen.js"
+  },
+  {
+    "key": "rpia",
+    "profile": "profile_rpia",
+    "extract": "extract_rpia",
+    "file": "js/fmc/rpia.js"
+  },
+  {
+    "key": "leith_wheeler",
+    "profile": "profile_leith_wheeler",
+    "extract": "extract_leith_wheeler",
+    "file": "js/fmc/leith_wheeler.js"
+  },
+  {
+    "key": "ci",
+    "profile": "profile_ci",
+    "extract": "extract_ci",
+    "file": "js/fmc/ci.js"
+  },
+  {
+    "key": "scotia",
+    "profile": "profile_scotia",
+    "extract": "extract_scotia",
+    "file": "js/fmc/scotia.js"
+  }
+]
