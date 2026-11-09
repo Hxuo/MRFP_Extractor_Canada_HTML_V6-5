@@ -4,11 +4,16 @@
 const $=id=>document.getElementById(id);
 const store=global.MRFP_STORAGE,engine=global.MRFP_ENGINE,reader=global.MRFP_PDF,out=global.MRFP_EXPORT;
 let selectedFile=null,active=null,previewUrl=null,stagedRescan=null,busy=false;
+let dataFilterState={active:false,source:'paste',rawText:'',entries:[],matches:[],unmatched:[],matchedCount:0,page:0};
+let excelFilterWorkbook=null,excelFilterBusy=false,excelFilterPreviewPage=0;
+// Cached index of every saved extraction, not just the document currently shown.
+let filterDocumentCache=[];
+let recentListedHashes=new Set();
 const html=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=x=>x===null||x===undefined||x===''?'—':Number(x).toFixed(2);
 function status(message,percent){$('status').textContent=message;if(percent!==undefined)$('progressBar').style.width=Math.max(0,Math.min(100,percent))+'%';}
 function error(e){status(e?.message||String(e));$('libnotice').textContent=(e?.message||String(e));$('libnotice').className='libnotice error';console.error(e);}
-function setBusy(b){busy=b;$('extract').disabled=b;$('rescan').disabled=b;$('extractText').disabled=b;$('pdf').disabled=b;$('settingsOpen').disabled=b;document.querySelectorAll('.nav-btn').forEach(n=>n.disabled=b);updateBatchDisplay();}
+function setBusy(b){busy=b;$('extract').disabled=b;$('rescan').disabled=b;$('extractText').disabled=b;$('pdf').disabled=b;$('settingsOpen').disabled=b;document.querySelectorAll('.nav-btn').forEach(n=>n.disabled=b);updateBatchDisplay();updateRecentListControls();}
 function notices(message,good=false){$('libnotice').textContent=message;$('libnotice').className='libnotice '+(good?'good':'');}
 async function ensureLibrary(){
  try{await reader.ensurePdf();notices('PDF.js ready. PDFs are processed in this browser; no document is uploaded to a server.',true);return true;}
@@ -17,11 +22,12 @@ async function ensureLibrary(){
 function viewPdf(blob){
  // v5 retains the original browser iframe as a reliable fallback only.
  // PDF.js source browsing is isolated from the financial extraction engine.
- global.MRFP_EVIDENCE_VIEWER.open(blob,active).catch(error);
+ return global.MRFP_EVIDENCE_VIEWER.open(blob,active).catch(error);
 }
 
 function stageSelectedFile(file){
  if(busy)return;
+ resetDataFilter(false);
  selectedFile=file||null;
  $('filename').textContent=selectedFile?.name||'No PDF selected';
  viewPdf(selectedFile); // Preview must not wait for the Extract button or PDF.js.
@@ -34,7 +40,9 @@ function stageSelectedFile(file){
  history().catch(error);
 }
 function inspectDoc(d){
- active=d;$('filename').textContent=d.filename||'Saved report';
+ active=d;
+ const batchEntry=batchEntries?.find(e=>e.hash===d.hash);if(batchEntry)batchEntry.snapshot=d;
+ $('filename').textContent=d.filename||'Saved report';
  $('download').classList.toggle('hidden',!(d.results||[]).length);
  $('overview').classList.add('hidden');$('actions').classList.remove('hidden');
  const results=d.results||[];
@@ -56,7 +64,7 @@ function inspectDoc(d){
   <div class="fund-info"><strong>FMC:</strong><span>${html(fmcs.join(', ')||'Unrecognized')}</span> <strong>Fund:</strong><span>${html(funds.join(' · ')||'Not detected')}</span></div>
   ${!results.length?'<div class="notice">No confident financial ratios found. Verify the PDF table manually; missing values were not invented.</div>':
   `<div class="scroller"><table aria-label="Extracted financial ratios">
-   <thead><tr><th>Class / Series</th><th>MER</th><th>TER</th><th>PTR</th><th>MRFP date</th><th>Action</th></tr></thead>
+   <thead><tr><th>Class / Series</th><th>MER</th><th title="Total Expense Ratio (TER)">TER</th><th>PTR</th><th>MRFP date</th><th>Action</th></tr></thead>
    <tbody>${results.map((r,i)=>`<tr id="resultrow${i}" data-index="${i}">
      <td>${html(r.class_name)}<div class="unit">${html(r.fund_name)}</div></td>
      <td class="number">${fmt(r.MER)}</td><td class="number">${fmt(r.TER)}</td><td class="number">${fmt(r.PTR)}</td>
@@ -65,11 +73,15 @@ function inspectDoc(d){
   ${d.notes?.length?`<p class="notice">${html(d.notes.join(' | '))}</p>`:''}
  `;
  $('verify').textContent=d.verified?'✓ Verified':'Mark results as verified';
- $('details').innerHTML=`<details><summary>Extraction details</summary><p class="muted">Source: ${html(d.filename)} · Last scanned: ${html(new Date(d.updated||Date.now()).toLocaleString())} · ${html(d.source||'PDF.js native text')}</p><p class="muted">Empty PDF values remain blank. OCR may be less accurate and should be reviewed against the source tables.</p></details>`;
+ $('details').innerHTML=`<details><summary>Extraction details</summary><p class="muted">Source: ${html(d.filename)} · Last scanned: ${html(new Date(d.updated||Date.now()).toLocaleString())} · ${html(d.source||'PDF.js native text')}</p><p class="muted">TER means Total Expense Ratio only; Trading Expense Ratio is never substituted. Missing Total Expense Ratios remain blank. OCR results should be verified against the source tables.</p></details>`;
  $('rescanPanel').classList.add('hidden');stagedRescan=null;
  $('result').querySelectorAll('button.edit').forEach(b=>b.addEventListener('click',()=>beginEdit(Number(b.dataset.index))));
  $('result').querySelectorAll('button.locate').forEach(b=>b.addEventListener('click',()=>global.MRFP_EVIDENCE_VIEWER.focusRow(active?.results?.[Number(b.dataset.index)]).catch(error)));
  global.MRFP_EVIDENCE_VIEWER.updateDoc(d);
+ if(dataFilterState.active){$('details').classList.add('hidden');$('actions').classList.add('hidden');renderFilteredResults();}
+ else{$('details').classList.remove('hidden');$('actions').classList.remove('hidden');}
+ updateDataFilterControls();
+ updateRecentListControls();
 }
 function displayDate(v){if(!v)return '—';const m=/^(\d{4})-(\d\d)-(\d\d)$/.exec(v);return m?`${m[2]}/${m[3]}/${m[1]}`:v;}
 function beginEdit(i){
@@ -196,11 +208,22 @@ async function saveEdit(i,tr){
   status('Correction saved',100);
  }catch(e){alert(e.message);}
 }
+function updateRecentListControls(){
+ const button=$('removeFromList');
+ if(!button)return;
+ const selected=!!(active?.hash&&recentListedHashes.has(active.hash));
+ button.disabled=busy||!selected;
+ button.title=selected?`Remove ${docFundName(active)} from Recent Documents`:'Select a document in Recent Documents first';
+ document.querySelectorAll('#history button.item').forEach(item=>item.classList.toggle('active',item.dataset.hash===active?.hash&&selected));
+}
 async function history(){
  const list=await store.listed();
+ recentListedHashes=new Set(list.map(d=>d.hash).filter(Boolean));
+ await refreshFilterDocumentCache();
  $('exportListed').classList.toggle('hidden',!list.length);
  $('recentCount').textContent=`${list.length} listed`;
  $('clearList').disabled=busy||!list.length;
+ updateRecentListControls();
  $('history').innerHTML=list.map(d=>`<button type="button" class="item ${active?.hash===d.hash?'active':''}" data-hash="${html(d.hash)}" title="Open saved results for ${html(d.filename)}"><span class="recent-item-name">${html(docFundName(d))}</span><span class="recent-item-file">${html(d.filename)}</span><span class="meta">${(d.results||[]).length} classes · ${html(docMRFPDate(d))} · ${html(new Date(d.updated||0).toLocaleString())} · ${d.verified?'Verified':'Unverified'}</span></button>`).join('')||'<p class="muted recent-empty">No recent documents yet. Extract a PDF or restore a saved fund from History.</p>';
  $('history').querySelectorAll('button.item').forEach(b=>b.onclick=async()=>{
   if(busy)return;
@@ -213,6 +236,7 @@ async function history(){
 }
 async function loadSaved(hash){
  const d=await store.get(hash);if(!d)throw Error('Document missing from local browser storage');
+ resetDataFilter(false);
  // History selection overrides a pending upload, including the native file input.
  selectedFile=null;$('pdf').value='';
  inspectDoc(d);viewPdf(d.blob);status(d.blob?'Loaded from history':'History loaded — original PDF not available.',100);await history();
@@ -237,7 +261,7 @@ async function legacyScanFile(){
   let doc=await store.get(hash);
   if(!doc){
    const analysis=await runAnalysis(selectedFile);
-   doc={hash,filename:selectedFile.name,blob:selectedFile,results:analysis.results,diagnostics:analysis.diagnostics,notes:analysis.notes,evidenceMap:analysis.evidenceMap,verified:false,has_corrections:false,source:'PDF.js native / optional OCR',created:Date.now()};
+   doc={hash,filename:selectedFile.name,blob:selectedFile,results:analysis.results,diagnostics:analysis.diagnostics,notes:analysis.notes,evidenceMap:analysis.evidenceMap,verified:false,has_corrections:false,source:'PDF.js native / optional OCR',terDefinition:'total-expense-ratio-v1',created:Date.now()};
    await store.put(doc);status(analysis.results.length?'Scan saved':'No confident ratio tables detected',100);
   } else{
    // Never overwrite existing successful, manually corrected or verified data.
@@ -248,7 +272,7 @@ async function legacyScanFile(){
     if(analysis.results.length){
      doc.results=analysis.results;doc.diagnostics=analysis.diagnostics;
      doc.notes=analysis.notes;doc.evidenceMap=analysis.evidenceMap;doc.source='PDF.js native / optional OCR';
-     doc.blob=selectedFile;await store.put(doc);
+     doc.blob=selectedFile;doc.terDefinition='total-expense-ratio-v1';await store.put(doc);
      status('Previous empty scan replaced with newly detected results',100);
     }else{
      if(!doc.blob){doc.blob=selectedFile;await store.put(doc);}
@@ -269,7 +293,7 @@ async function scanPasted(){
   const pages=reader.fromPastedText(text),analysis=engine.analyzePages(pages);
   const bytes=new TextEncoder().encode(text),blob=new Blob([bytes],{type:'text/plain'});
   const hash='manual-'+[...bytes.slice(0,32)].reduce((a,b)=>((a*31+b)>>>0),bytes.length).toString(16)+'-'+bytes.length;
-  let doc={hash,filename:'Pasted MRFP text',blob:null,results:analysis.results,diagnostics:analysis.diagnostics,notes:['Text-paste fallback: check results carefully; PDF geometry is unavailable.'],verified:false,has_corrections:false,source:'Manual text pasted',created:Date.now()};
+  let doc={hash,filename:'Pasted MRFP text',blob:null,results:analysis.results,diagnostics:analysis.diagnostics,notes:['Text-paste fallback: check results carefully; PDF geometry is unavailable.'],verified:false,has_corrections:false,source:'Manual text pasted',terDefinition:'total-expense-ratio-v1',created:Date.now()};
   await store.put(doc);await store.addToWorkspace(hash);inspectDoc(doc);viewPdf(null);await history();status('Pasted text analyzed',100);
  }catch(e){error(e);}finally{setBusy(false);}
 }
@@ -332,7 +356,7 @@ async function confirmRescan(){
  if (!await askRescanReplace()) return;
  const original=await store.get(active.hash);
  if(!original||original.updated!==stagedRescan.token){alert('Saved document has changed. Run Re-scan again.');return;}
- original.results=stagedRescan.results;original.diagnostics=stagedRescan.diagnostics;original.notes=stagedRescan.notes;original.evidenceMap=stagedRescan.evidenceMap;original.verified=false;original.has_corrections=false;
+ original.results=stagedRescan.results;original.diagnostics=stagedRescan.diagnostics;original.notes=stagedRescan.notes;original.evidenceMap=stagedRescan.evidenceMap;original.verified=false;original.has_corrections=false;original.terRequiresRescan=false;original.terDefinition='total-expense-ratio-v1';
  await store.put(original);inspectDoc(original);viewPdf(original.blob);await history();updateHistoryReturn();status('Re-scan saved; verification reset',100);
 }
 function download(blob,filename){
@@ -348,8 +372,449 @@ async function exportDocs(scope,type='xlsx'){
   download(type==='csv'?out.csv(docs):out.excel(docs),`MRFP_${basename}.${type}`);
  }catch(e){error(e);}
 }
+
+
+function normalizeDataFilterText(value){
+ return String(value??'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+  .replace(/&/g,' and ').replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ');
+}
+function cleanDataFilterLine(line){
+ let value=String(line??'').trim();
+ value=value.replace(/^\s*(?:[•*–—-]\s*|\d+[.)]\s*)/,'');
+ // Long numeric reference IDs are metadata, not part of the fund name.
+ // Four-digit fund/year labels remain intact.
+ if(/^\d{4,}$/.test(value))return '';
+ value=value.replace(/^\s*\d{5,}\s*(?:[-–—:|,]\s*|\s+)(?=[A-Za-z])/,'');
+ value=value.replace(/\s+\d{5,}\s*$/,'');
+ value=value.replace(/^\s*[-–—:|,]+\s*/,'');
+ return value.trim();
+}
+function parseDataFilterLine(line){
+ let value=String(line??'').trim();
+ value=value.replace(/^\s*(?:[•*–—-]\s*|\d+[.)]\s*)/,'');
+ let lipperId='';
+ // Lipper ID may be pasted before or after the fund name. Capture it as
+ // export metadata while keeping it out of all fund/class matching logic.
+ const leading=value.match(/^(\d{5,})(?=$|\s|[-–—:|,])/);
+ if(leading){
+  lipperId=leading[1];
+  value=value.slice(leading[0].length).replace(/^\s*[-–—:|,]+\s*/,'').trim();
+ }
+ const trailing=value.match(/(?:^|\s|[-–—:|,])(\d{5,})\s*$/);
+ if(trailing){
+  if(!lipperId)lipperId=trailing[1];
+  value=value.slice(0,trailing.index).replace(/[\s\-–—:|,]+$/,'').trim();
+ }
+ return {name:cleanDataFilterLine(value),lipperId};
+}
+function parseDataFilterEntries(rawText){
+ const byName=new Map(),entries=[];
+ for(const raw of String(rawText??'').split(/\r?\n/)){
+  const parsed=parseDataFilterLine(raw),name=parsed.name,normalized=normalizeDataFilterText(name);
+  if(!name||!normalized)continue;
+  const existing=byName.get(normalized);
+  if(existing){
+   // If the same request is pasted more than once, retain an available ID
+   // from either line without creating duplicate matching rows.
+   if(!existing.lipperId&&parsed.lipperId)existing.lipperId=parsed.lipperId;
+   continue;
+  }
+  const entry={raw,name,normalized,lipperId:parsed.lipperId||''};
+  byName.set(normalized,entry);entries.push(entry);
+ }
+ return entries;
+}
+async function refreshFilterDocumentCache(){
+ // Data Needed Only is intentionally scoped to the Recent Documents workspace.
+ // Saved History documents that have not been restored/listed are excluded.
+ const listed=await store.listed(),byHash=new Map();
+ for(const entry of batchEntries){
+  if(entry.hash&&['completed','partial'].includes(entry.state))byHash.set(entry.hash,entry);
+ }
+ const docs=new Map();
+ const add=(doc,entryId=null,sourceName='')=>{
+  if(!doc||!Array.isArray(doc.results)||!doc.results.length)return;
+  const key=doc.hash||`${sourceName||doc.filename||'document'}:${entryId??'listed'}`;
+  if(docs.has(key))return;
+  docs.set(key,{doc,entryId,sourceName:sourceName||doc.filename||'Unknown PDF'});
+ };
+ for(const doc of listed){
+  const entry=byHash.get(doc.hash);
+  add(doc,entry?.id??null,entry?.file?.name||doc.filename);
+ }
+ filterDocumentCache=[...docs.values()];
+ return filterDocumentCache;
+}
+function collectFilterDocuments(){
+ return filterDocumentCache;
+}
+function normalizeDataFilterClassText(value){
+ return String(value??'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+  .replace(/[–—−]/g,'-').replace(/&/g,' and ')
+  // Treat a hyphen adjacent to the word "Series" as a word separator,
+  // while preserving code suffixes such as F-2 as a single identifier.
+  .replace(/\bseries-/g,'series ').replace(/-series\b/g,' series')
+  .replace(/[^a-z0-9\/-]+/g,' ').replace(/\s*-\s*/g,'-')
+  .replace(/\s*\/\s*/g,' / ').replace(/\s+/g,' ').trim();
+}
+function classDescriptorCodes(value){
+ const normalized=normalizeDataFilterClassText(value);
+ if(!normalized)return [];
+ // Split only on a spaced slash (or the word "and"). This preserves
+ // legitimate codes such as 75/75 while recognizing combined table headings.
+ const parts=normalized.split(/\s+\/\s+|\s+and\s+/).filter(Boolean);
+ const hasSeries=parts.some(part=>/\bseries\b/.test(part));
+ const hasClass=parts.some(part=>/\bclass\b/.test(part));
+ const generic=new Set(['class','series','share','shares','unit','units','the','of','and','fund','annual','interim','semi','semiannual','report','financial','statement','statements']);
+ const codes=[];
+ for(let part of parts){
+  // In combined headings like "Investor / Advisor Series", the final
+  // descriptor applies to both sides of the slash.
+  if(hasSeries&&!/\b(?:series|class)\b/.test(part))part+=' series';
+  else if(hasClass&&!/\b(?:series|class)\b/.test(part))part+=' class';
+  const tokens=part.split(' ').filter(token=>token&&!generic.has(token)&&!/^\d{4}$/.test(token));
+  if(!tokens.length)continue;
+  let code=tokens.join(' ');
+  // PDF text and pasted lists may represent F-2 as either "F-2" or "F 2".
+  if(tokens.length===2&&/^[a-z]$/.test(tokens[0])&&/^\d+$/.test(tokens[1]))code=`${tokens[0]}-${tokens[1]}`;
+  else if(tokens.length===2&&/^\d+$/.test(tokens[0])&&/^\d+$/.test(tokens[1]))code=`${tokens[0]}/${tokens[1]}`;
+  codes.push(code);
+ }
+ return [...new Set(codes)];
+}
+function classQualifierMatches(qualifier,className,classAliases=[]){
+ const qualifierText=normalizeDataFilterClassText(qualifier);
+ if(!qualifierText)return true; // No class qualifier means all classes for the fund.
+ // Arrow Capital's historical names are written as "AN Series" / "A Series",
+ // whereas current identities are "Series A" / "Series AD". Match an
+ // explicit old-style alias only against the row's declared alias list.
+ // This also ensures a bare "A" selects current Series A, not Series AD.
+ const aliasStyle=/^[a-z0-9-]+\s+series$/i.test(qualifierText);
+ if(aliasStyle&&Array.isArray(classAliases)&&classAliases.length){
+  return classAliases.some(alias=>normalizeDataFilterClassText(alias)===qualifierText);
+ }
+ // If the user pastes the full display name, strip only its trailing
+ // re-designation note before applying the existing exact class-code logic.
+ const canonicalText=qualifierText.replace(/\s+re-designated\s+from\s+.+$/i,'').trim();
+ const requested=classDescriptorCodes(canonicalText);
+ if(!requested.length)return true;
+ const available=classDescriptorCodes(className);
+ if(!available.length)return false;
+ // Exact canonical code matching prevents Series F from including Series F-2.
+ // A requested component may still match a combined published heading such
+ // as "Series F / Private Series" because that row represents one table.
+ return requested.every(code=>available.includes(code));
+}
+function dataFilterRowFundParts(row){
+ const fundText=normalizeDataFilterClassText(row?.fund_name);
+ const classText=normalizeDataFilterClassText(row?.class_name);
+ let baseFundText=fundText;
+ // Some extraction layouts include the class/series in Fund Name as well as
+ // storing it separately in Class Name. Strip that duplicate suffix only
+ // when it is an exact trailing match; keep the published class descriptor.
+ if(classText&&fundText.endsWith(classText)){
+  const cut=fundText.length-classText.length;
+  if(cut===0||/\s$/.test(fundText.slice(0,cut)))baseFundText=fundText.slice(0,cut).trim();
+ }
+ return {
+  baseFundText,
+  baseFund:normalizeDataFilterText(baseFundText),
+  classText
+ };
+}
+function dataFilterLineMatchesRow(entry,row){
+ const parts=dataFilterRowFundParts(row);
+ const fund=parts.baseFund;
+ if(!fund||!entry.normalized.includes(fund))return false;
+ let qualifier='';
+ // Use a class-aware normalization of the original uploaded/pasted name.
+ // This works whether the extracted class is stored separately or is also
+ // repeated at the end of Fund Name.
+ const classInput=normalizeDataFilterClassText(entry.name);
+ const classIndex=parts.baseFundText?classInput.indexOf(parts.baseFundText):-1;
+ if(classIndex>=0){
+  qualifier=[classInput.slice(0,classIndex),classInput.slice(classIndex+parts.baseFundText.length)].filter(Boolean).join(' ').trim();
+ }else{
+  // Fallback for harmless punctuation differences in fund names.
+  const index=entry.normalized.indexOf(fund);
+  const before=entry.normalized.slice(0,index).trim();
+  const after=entry.normalized.slice(index+fund.length).trim();
+  qualifier=[before,after].filter(Boolean).join(' ').trim();
+ }
+ // A fund-only request intentionally matches all classes. If a class was
+ // supplied, require an exact canonical class match (Series F != Series F-2).
+ return !qualifier||classQualifierMatches(qualifier,row?.class_identity||parts.classText||row?.class_name,row?.class_aliases||[]);
+}
+function rowFmcLabel(doc,row){
+ if(row?.fmc)return row.fmc;
+ if(row?.fmc_key)return engine.REGISTRY.find(p=>p.key===row.fmc_key)?.label||row.fmc_key;
+ const info=(doc?.diagnostics||[]).find(x=>x&&x.fmc_detection?.status==='matched');
+ if(info?.fmc_label)return info.fmc_label;
+ const key=info?.fmc_detection?.fmc_key;
+ return engine.REGISTRY.find(p=>p.key===key)?.label||key||'—';
+}
+function buildDataFilterResults(rawText){
+ return buildDataFilterResultsFromEntries(parseDataFilterEntries(rawText));
+}
+function buildDataFilterResultsFromEntries(entries){
+ const sources=collectFilterDocuments();
+ const allRows=sources.flatMap(source=>(source.doc.results||[]).map((row,rowIndex)=>({
+  ...source,row,rowIndex,fmc:rowFmcLabel(source.doc,row)
+ })));
+ const matchesByKey=new Map(),unmatched=[],matchedLines=[];
+ for(const entry of entries){
+  // Matching is intentionally independent of Lipper ID. A name-only request
+  // is just as valid as one carrying an ID; the ID is attached only for export.
+  const candidates=allRows.filter(item=>dataFilterLineMatchesRow(entry,item.row));
+  if(!candidates.length){unmatched.push(entry);continue;}
+  // Prefer the most specific extracted base fund name when names overlap.
+  const longest=Math.max(...candidates.map(item=>dataFilterRowFundParts(item.row).baseFund.length));
+  const matching=candidates.filter(item=>dataFilterRowFundParts(item.row).baseFund.length===longest);
+  if(!matching.length){unmatched.push(entry);continue;}
+  matchedLines.push(entry);
+  for(const item of matching){
+   const docKey=item.doc.hash||item.sourceName;
+   const rowKey=item.row.row_id||`${item.row.fund_name}|${item.row.class_name}|${item.row.report_date}|${item.rowIndex}`;
+   const key=`${docKey}::${rowKey}`;
+   if(!matchesByKey.has(key))matchesByKey.set(key,{...item,lipperId:entry.lipperId||item.lipperId||''});
+   else if(!matchesByKey.get(key).lipperId&&entry.lipperId)matchesByKey.get(key).lipperId=entry.lipperId;
+  }
+ }
+ return {entries,matches:[...matchesByKey.values()],unmatched,matchedCount:matchedLines.length};
+}
+function updateDataFilterControls(){
+ const open=$('dataFilterOpen'),upload=$('excelFilterOpen'),clear=$('dataFilterClear'),exportButton=$('exportFiltered');
+ if(!open||!clear||!exportButton)return;
+ const available=collectFilterDocuments().length>0;
+ open.disabled=busy||!available;
+ if(upload){upload.disabled=busy||excelFilterBusy||!available;upload.title=available?'Upload Asset ID and Fund Name columns from an Excel workbook':'Add or restore a document to Recent Documents before filtering';}
+ open.title=available?'Paste fund names to display only requested records from Recent Documents':'Add or restore a document to Recent Documents to enable filtering';
+ clear.classList.toggle('hidden',!dataFilterState.active);
+ exportButton.disabled=busy||!dataFilterState.active||!dataFilterState.matches.length;
+ exportButton.title=exportButton.disabled?'Apply a filter with matching results first':'Download only the filtered extraction rows as CSV';
+}
+function renderFilteredResults(){
+ if(!dataFilterState.active)return;
+ const matches=dataFilterState.matches||[],missing=matches.reduce((n,item)=>n+['MER','TER','PTR'].filter(k=>item.row[k]===null||item.row[k]===undefined||item.row[k]==='').length,0);
+ const pageSize=10,totalPages=Math.max(1,Math.ceil(matches.length/pageSize));
+ const page=Math.min(Math.max(0,Number(dataFilterState.page)||0),totalPages-1);
+ dataFilterState.page=page;
+ const startIndex=page*pageSize,pageMatches=matches.slice(startIndex,startIndex+pageSize);
+ $('overview').classList.add('hidden');$('details').classList.add('hidden');$('actions').classList.add('hidden');
+ $('result').innerHTML=`
+  <div class="stats filter-stats">
+   <div class="stat"><b>${dataFilterState.matchedCount}</b><small>Matched entries</small></div>
+   <div class="stat"><b>${matches.length}</b><small>Rows displayed</small></div>
+   <div class="stat"><b>${missing}</b><small>Missing values</small></div>
+   <div class="stat"><b>${dataFilterState.unmatched.length}</b><small>Not found</small></div>
+  </div>
+  <div class="filter-result-note">Showing matching records from Recent Documents only. Documents in saved History must be restored to Recent Documents before they can be matched. Lipper IDs are ignored for matching but retained for Export Filtered when supplied; fund name and optional Class / Series are used.</div>
+  ${matches.length?`
+   <div class="filtered-results-heading">
+    <span>Matched extraction records</span>
+    <div class="filtered-results-pagination" aria-label="Filtered results pagination">
+     <button type="button" data-filter-page="${page-1}" aria-label="Previous page" ${page===0?'disabled':''}>&lt;</button>
+     <span>${page+1} out of ${totalPages}</span>
+     <button type="button" data-filter-page="${page+1}" aria-label="Next page" ${page>=totalPages-1?'disabled':''}>&gt;</button>
+    </div>
+   </div>
+   <div class="scroller"><table class="filtered-results-table" aria-label="Filtered extracted financial ratios"><thead><tr><th>Source PDF</th><th>FMC</th><th>Class / Series and Fund</th><th>MER</th><th title="Total Expense Ratio (TER)">TER</th><th>PTR</th><th>MRFP date</th><th>Action</th></tr></thead><tbody>${pageMatches.map((item,i)=>{const index=startIndex+i;return `<tr id="filteredrow${index}">
+    <td class="small filter-source-file">${html(item.sourceName)}</td><td>${html(item.fmc)}</td>
+    <td>${html(item.row.class_name)}<div class="unit">${html(item.row.fund_name)}</div></td>
+    <td class="number">${fmt(item.row.MER)}</td><td class="number">${fmt(item.row.TER)}</td><td class="number">${fmt(item.row.PTR)}</td>
+    <td class="small">${html(displayDate(item.row.report_date))}</td>
+    <td><span class="result-actions"><button class="ghost filtered-locate" data-index="${index}" type="button" title="Locate this row in its source PDF" ${busy||!(item.doc.blob||item.entryId!==null)?'disabled':''}><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button><button class="ghost filtered-edit" data-index="${index}" type="button" ${busy?'disabled':''}>Edit</button></span></td>
+   </tr>`;}).join('')}</tbody></table></div>`:'<div class="notice">No extracted records matched the supplied fund names and Class / Series.</div>'}
+  ${dataFilterState.unmatched.length?`<details class="filter-unmatched"><summary>Not found (${dataFilterState.unmatched.length})</summary><ul>${dataFilterState.unmatched.map(entry=>`<li>${html(entry.name)}</li>`).join('')}</ul></details>`:''}
+ `;
+ $('result').querySelectorAll('button[data-filter-page]').forEach(button=>button.addEventListener('click',()=>{
+  const next=Number(button.dataset.filterPage);
+  if(Number.isInteger(next)&&next>=0&&next<totalPages){dataFilterState.page=next;renderFilteredResults();}
+ }));
+ $('result').querySelectorAll('button.filtered-locate').forEach(button=>button.addEventListener('click',()=>focusFilteredMatch(dataFilterState.matches[Number(button.dataset.index)]).catch(error)));
+ $('result').querySelectorAll('button.filtered-edit').forEach(button=>button.addEventListener('click',()=>editFilteredMatch(dataFilterState.matches[Number(button.dataset.index)]).catch(error)));
+ updateDataFilterControls();
+}
+function applyDataFilter(rawText){
+ const parsed=buildDataFilterResults(rawText);
+ if(!parsed.entries.length){alert('Paste at least one fund name. Numeric IDs alone are ignored.');return false;}
+ dataFilterState={active:true,source:'paste',rawText,entries:parsed.entries,matches:parsed.matches,unmatched:parsed.unmatched,matchedCount:parsed.matchedCount,page:0};
+ renderFilteredResults();return true;
+}
+async function refreshDataFilterResults(){
+ if(!dataFilterState.active)return;
+ await refreshFilterDocumentCache();
+ const next=dataFilterState.source==='excel'
+  ?buildDataFilterResultsFromEntries(dataFilterState.entries)
+  :buildDataFilterResults(dataFilterState.rawText);
+ dataFilterState={...dataFilterState,entries:next.entries,matches:next.matches,unmatched:next.unmatched,matchedCount:next.matchedCount};
+ renderFilteredResults();
+}
+function resetDataFilter(restoreView=true){
+ dataFilterState={active:false,source:'paste',rawText:'',entries:[],matches:[],unmatched:[],matchedCount:0,page:0};
+ updateDataFilterControls();
+ if(restoreView){
+  if(active)inspectDoc(active);
+  else{$('result').replaceChildren();$('details').replaceChildren();$('actions').classList.add('hidden');$('overview').classList.remove('hidden');}
+ }
+}
+// Excel upload uses the SAME matching path as manual paste. IDs are export-only metadata.
+function entriesFromExcelRows(rows){
+ const byName=new Map(),entries=[];
+ for(const row of rows||[]){
+  // Fund Name is required; Asset ID / Lipper ID is optional metadata only.
+  // Never discard a valid fund row just because its ID cell is blank.
+  const name=String(row.name??'').trim().replace(/\s+/g,' ');
+  const normalized=normalizeDataFilterText(name);
+  if(!name||!normalized)continue;
+  const lipperId=String(row.lipperId??'').trim();
+  const prior=byName.get(normalized);
+  if(prior){if(!prior.lipperId&&lipperId)prior.lipperId=lipperId;continue;}
+  const entry={raw:name,name,normalized,lipperId};
+  byName.set(normalized,entry);entries.push(entry);
+ }
+ return entries;
+}
+function excelImportStatus(message,isError=false){
+ const target=$('excelFilterStatus');
+ if(!target)return;
+ target.textContent=message;target.classList.toggle('error',isError);
+}
+function previewExcelFilterSheet(resetPage=true){
+ const select=$('excelFilterSheet'),preview=$('excelFilterPreview'),apply=$('excelFilterApply');
+ const sheet=excelFilterWorkbook?.sheets?.[Number(select.value)];
+ apply.disabled=true;
+ if(!sheet){preview.innerHTML='';excelFilterPreviewPage=0;return;}
+ const found=sheet.analysis;
+ if(!found.valid){
+  excelImportStatus(found.error,true);
+  preview.innerHTML='<p class="filter-dialog-hint">Select a worksheet containing both Asset ID and Fund Name headers.</p>';
+  excelFilterPreviewPage=0;
+  return;
+ }
+ const pageSize=10,totalPages=Math.max(1,Math.ceil(found.entries.length/pageSize));
+ if(resetPage)excelFilterPreviewPage=0;
+ excelFilterPreviewPage=Math.min(Math.max(0,excelFilterPreviewPage),totalPages-1);
+ const startIndex=excelFilterPreviewPage*pageSize;
+ const sample=found.entries.slice(startIndex,startIndex+pageSize);
+ preview.innerHTML=`
+  <p class="excel-import-section-label">Detected columns</p>
+  <div class="excel-detected-columns"><span class="excel-column-badge">Asset ID · Found</span><span class="excel-column-badge">Fund Name · Found</span></div>
+  <div class="excel-import-stats"><span><b>${found.rowsRead}</b><small>Rows read</small></span><span><b>${found.validRows}</b><small>Valid entries</small></span><span><b>${found.skipped}</b><small>Skipped rows</small></span></div>
+  <div class="excel-preview-heading">
+   <p class="excel-import-section-label">Sample imported entries</p>
+   <div class="excel-preview-pagination" aria-label="Imported entries pagination">
+    <button type="button" data-excel-preview-page="${excelFilterPreviewPage-1}" aria-label="Previous page" ${excelFilterPreviewPage===0?'disabled':''}>&lt;</button>
+    <span>${excelFilterPreviewPage+1} out of ${totalPages}</span>
+    <button type="button" data-excel-preview-page="${excelFilterPreviewPage+1}" aria-label="Next page" ${excelFilterPreviewPage>=totalPages-1?'disabled':''}>&gt;</button>
+   </div>
+  </div>
+  <div class="excel-preview-table-wrap"><table class="excel-filter-table"><thead><tr><th>Asset ID / Lipper ID</th><th>Fund Name</th></tr></thead><tbody>${sample.map(row=>`<tr><td>${html(row.lipperId)}</td><td>${html(row.name)}</td></tr>`).join('')}</tbody></table></div>`;
+ preview.querySelectorAll('[data-excel-preview-page]').forEach(button=>button.addEventListener('click',()=>{
+  const next=Number(button.dataset.excelPreviewPage);
+  if(Number.isInteger(next)&&next>=0&&next<totalPages){excelFilterPreviewPage=next;previewExcelFilterSheet(false);}
+ }));
+ excelImportStatus(`${found.validRows} valid entries detected. Confirm to filter matching records from Recent Documents.`);
+ apply.disabled=!found.validRows||excelFilterBusy;
+}
+async function loadExcelFilterFile(file){
+ if(!file)return;
+ const select=$('excelFilterSheet'),preview=$('excelFilterPreview'),dialog=$('excelFilterDialog');
+ excelFilterWorkbook=null;select.replaceChildren();preview.replaceChildren();
+ $('excelFilterFileName').textContent=`${file.name} · ${/\.csv$/i.test(file.name)?'CSV Data':'Excel Workbook'}`;
+ $('excelFilterSheetRow').classList.add('hidden');
+ $('excelFilterApply').disabled=true;
+ excelFilterBusy=true;updateDataFilterControls();
+ excelImportStatus('Reading file locally…');
+ try{
+  if(!global.MRFP_FILTER_EXCEL)throw Error('Offline Excel reader is missing. Copy js/filter-excel.js into the project.');
+  const book=await global.MRFP_FILTER_EXCEL.readWorkbook(file);
+  excelFilterWorkbook=book;
+  for(let i=0;i<book.sheets.length;i++){
+   const sheet=book.sheets[i];const option=document.createElement('option');
+   option.value=String(i);option.textContent=`${sheet.name}${sheet.analysis.valid?' — columns found':' — columns missing'}`;
+   select.appendChild(option);
+  }
+  const preferred=book.sheets.findIndex(sheet=>sheet.analysis.valid&&sheet.analysis.validRows>0);
+  if(preferred>=0)select.value=String(preferred);
+  if(book.sheets.length>1)$('excelFilterSheetRow').classList.remove('hidden');
+  else select.value='0';
+  await refreshFilterDocumentCache();
+  if(!collectFilterDocuments().length)throw Error('Add or restore at least one document to Recent Documents before filtering.');
+ }catch(err){
+  excelFilterWorkbook=null;$('excelFilterSheetRow').classList.add('hidden');
+  excelImportStatus(err.message||String(err),true);
+ }finally{
+  excelFilterBusy=false;updateDataFilterControls();
+ }
+ if(excelFilterWorkbook)previewExcelFilterSheet();
+ else{preview.innerHTML='';$('excelFilterApply').disabled=true;}
+ if(!dialog.open)dialog.showModal();
+}
+function openExcelFilePicker(){
+ // Must remain synchronous inside the button click so the browser opens its
+ // native file picker immediately, without an intermediate application modal.
+ if(busy||excelFilterBusy)return;
+ const input=$('excelFilterFile');
+ input.value='';
+ input.click();
+}
+function applyExcelFilter(){
+ if(busy||excelFilterBusy||!excelFilterWorkbook)return false;
+ const sheet=excelFilterWorkbook.sheets[Number($('excelFilterSheet').value)];
+ if(!sheet?.analysis?.valid)return false;
+ const entries=entriesFromExcelRows(sheet.analysis.entries);
+ if(!entries.length){excelImportStatus('No valid fund names were found in this worksheet.',true);return false;}
+ const parsed=buildDataFilterResultsFromEntries(entries);
+ dataFilterState={active:true,source:'excel',rawText:'',entries:parsed.entries,matches:parsed.matches,unmatched:parsed.unmatched,matchedCount:parsed.matchedCount,page:0,
+  sourceFile:excelFilterWorkbook.name,sourceSheet:sheet.name};
+ renderFilteredResults();
+ $('excelFilterDialog').close();
+ return true;
+}
+async function activateFilteredSource(item){
+ if(item.entryId!==null&&item.entryId!==undefined){
+  await selectBatchEntry(item.entryId,{awaitViewer:true});
+  return;
+ }
+ if(!item.doc?.blob)throw Error('The original PDF is not available in saved History. Restore or re-upload the source PDF to view its evidence.');
+ currentBatchSelection=null;openedFromHistory=true;
+ active=item.doc;selectedFile=null;$('pdf').value='';
+ $('filename').textContent=item.doc.filename||item.sourceName;
+ inspectDoc(item.doc);updateHistoryReturn();
+ await viewPdf(item.doc.blob);
+}
+async function focusFilteredMatch(item){
+ if(!item)return;
+ await activateFilteredSource(item);
+ await global.MRFP_EVIDENCE_VIEWER.focusRow(item.row);
+}
+async function editFilteredMatch(item){
+ if(!item)return;
+ resetDataFilter(false);
+ await activateFilteredSource(item);
+ beginEdit(item.rowIndex);
+}
+function buildFilteredCsvContent(matches){
+ const q=value=>'"'+String(value??'').replace(/"/g,'""')+'"';
+ const headers=['Lipper ID','Fund Name','MER','TER','PTR','MRFP DATE'];
+ const lines=[headers,...matches.map(item=>[
+  item.lipperId||'',
+  [item.row.fund_name,item.row.class_name].map(value=>String(value??'').trim()).filter(Boolean).join(' '),
+  item.row.MER??'',item.row.TER??'',item.row.PTR??'',item.row.report_date||''
+ ])];
+ return '\ufeff'+lines.map(line=>line.map(q).join(',')).join('\r\n');
+}
+function exportFilteredResults(){
+ if(!dataFilterState.active||!dataFilterState.matches.length)return;
+ const csv=buildFilteredCsvContent(dataFilterState.matches);
+ const date=new Date().toISOString().slice(0,10);
+ download(new Blob([csv],{type:'text/csv;charset=utf-8'}),`MRFP_Filtered_Results_${date}.csv`);
+}
 function clearDisplayedDocument(){
- selectedFile=null;active=null;stagedRescan=null;$('pdf').value='';
+ resetDataFilter(false);
+ selectedFile=null;active=null;stagedRescan=null;
+ updateRecentListControls();$('pdf').value='';
  $('filename').textContent='No PDF selected';viewPdf(null);
  $('result').replaceChildren();$('details').replaceChildren();
  $('download').classList.add('hidden');$('actions').classList.add('hidden');
@@ -428,6 +893,37 @@ function confirmClearList() {
   });
 }
 
+function confirmRemoveFromList(doc){
+ const modal=$('removeFromListModal');
+ if(modal.open)return Promise.resolve(false);
+ $('removeFromListFund').textContent=docFundName(doc);
+ $('removeFromListFile').textContent=doc.filename||'Unknown PDF';
+ return new Promise(resolve=>{
+  let approved=false;
+  modal.onclose=()=>resolve(approved);
+  $('removeFromListProceed').onclick=()=>{approved=true;modal.close();};
+  $('removeFromListCancel').onclick=()=>modal.close();
+  $('removeFromListClose').onclick=()=>modal.close();
+  modal.onclick=event=>{if(event.target===modal)modal.close();};
+  modal.showModal();
+  $('removeFromListCancel').focus();
+ });
+}
+async function removeSelectedFromRecentList(){
+ if(busy||!active?.hash)return;
+ const hash=active.hash;
+ const listed=await store.listed();
+ const doc=listed.find(item=>item.hash===hash);
+ if(!doc){recentListedHashes.delete(hash);updateRecentListControls();return;}
+ if(!await confirmRemoveFromList(doc))return;
+ const removed=await store.removeFromWorkspace(hash);
+ if(!removed)return;
+ recentListedHashes.delete(hash);
+ await history();
+ if(dataFilterState.active)await refreshDataFilterResults();
+ status(`Removed ${docFundName(doc)} from Recent Documents. Saved History and the original PDF were kept.`,0);
+}
+
 // v4 UI orchestration: independent of the v3.1 PDF reader, FMC engine and Excel writer.
 const MAX_BATCH=5;
 let batchEntries=[],batchSerial=0,currentBatchSelection=null,openedFromHistory=false;
@@ -477,6 +973,7 @@ function updateBatchDisplay(){
  $('batchSummary').innerHTML=hasSummary?[
   [completed.length,'PDFs completed'],[classes,'Classes / series'],[mer,'MER values'],[ter,'TER values'],[ptr,'PTR values'],[missing,'Missing values'],[failed.length,'Failed']
  ].map(([n,label])=>`<div class="batch-stat"><b>${n}</b><small>${label}</small></div>`).join(''):'';
+ updateDataFilterControls();
 }
 function validPDF(file){return file&&/\.pdf$/i.test(file.name)&&(!file.type||file.type==='application/pdf'||file.type==='application/x-pdf');}
 function addBatchFiles(files){
@@ -499,7 +996,7 @@ function addBatchFiles(files){
  else if(added.length)notices(`Ready: ${batchEntries.length} of ${MAX_BATCH} PDFs. Click Extract selected PDFs.`,true);
  $('pdf').value='';
 }
-async function selectBatchEntry(id){
+async function selectBatchEntry(id,{awaitViewer=false}={}){
  if(busy)return;
  const entry=batchEntries.find(e=>e.id===id);if(!entry)return;
  currentBatchSelection=id;openedFromHistory=false;updateHistoryReturn();
@@ -507,12 +1004,14 @@ async function selectBatchEntry(id){
  $('filename').textContent=entry.file.name;
  if(entry.hash&&(entry.state==='completed'||entry.state==='partial')){
   const doc=await store.get(entry.hash);
-  if(doc){entry.snapshot=doc;inspectDoc(doc);if(!doc.blob){$('result').querySelectorAll('button.locate').forEach(b=>b.disabled=false);}viewPdf(doc.blob||entry.file);status('Showing '+entry.file.name);updateBatchDisplay();return;}
+  if(doc){entry.snapshot=doc;inspectDoc(doc);if(!doc.blob){$('result').querySelectorAll('button.locate').forEach(b=>b.disabled=false);}const viewerPromise=viewPdf(doc.blob||entry.file);if(awaitViewer)await viewerPromise;status('Showing '+entry.file.name);updateBatchDisplay();return;}
  }
  active=null;$('result').replaceChildren();$('details').replaceChildren();
  $('download').classList.add('hidden');$('actions').classList.add('hidden');$('overview').classList.remove('hidden');
  $('overview').innerHTML=`<div class="emptyIcon">▤</div><b>${html(entry.file.name)}</b><br><small>${html(entry.error||entry.message||'Not yet processed')}</small>`;
- viewPdf(entry.file);status('Selected: '+entry.file.name,0);updateBatchDisplay();
+ const viewerPromise=viewPdf(entry.file);if(awaitViewer)await viewerPromise;status('Selected: '+entry.file.name,0);
+ if(dataFilterState.active)renderFilteredResults();
+ updateBatchDisplay();
 }
 function removeBatchEntry(id){
  if(busy)return;
@@ -522,11 +1021,12 @@ function removeBatchEntry(id){
   if(batchEntries.length)selectBatchEntry(batchEntries[0].id).catch(error);
  }
  updateBatchDisplay();
+ if(dataFilterState.active)refreshDataFilterResults().catch(error);
 }
 function clearBatch(){
  if(busy)return;batchEntries=[];currentBatchSelection=null;openedFromHistory=false;updateHistoryReturn();
  clearDisplayedDocument();$('overview').innerHTML='<div class="emptyIcon">▤</div>Choose one to five MRFP PDFs to begin.<br><small>Existing saved history remains unchanged.</small>';
- updateBatchDisplay();status('Batch cleared — saved history kept',0);
+ updateBatchDisplay();refreshFilterDocumentCache().catch(error);status('Batch cleared — saved history kept',0);
 }
 async function extractAndSave(file){
  if(!validPDF(file))throw Error('Only PDF documents are supported');
@@ -536,11 +1036,11 @@ async function extractAndSave(file){
  let doc=await store.get(hash);
  if(!doc){
   const analysis=await runAnalysis(file);
-  doc={hash,filename:file.name,blob:file,results:analysis.results,diagnostics:analysis.diagnostics,notes:analysis.notes,evidenceMap:analysis.evidenceMap,verified:false,has_corrections:false,source:'PDF.js native / optional OCR',created:Date.now()};
+  doc={hash,filename:file.name,blob:file,results:analysis.results,diagnostics:analysis.diagnostics,notes:analysis.notes,evidenceMap:analysis.evidenceMap,verified:false,has_corrections:false,source:'PDF.js native / optional OCR',terDefinition:'total-expense-ratio-v1',created:Date.now()};
   await store.put(doc);
  }else if(!(doc.results||[]).length&&!doc.has_corrections&&!doc.verified){
   const analysis=await runAnalysis(file);
-  if(analysis.results.length){doc.results=analysis.results;doc.diagnostics=analysis.diagnostics;doc.notes=analysis.notes;doc.evidenceMap=analysis.evidenceMap;doc.source='PDF.js native / optional OCR';doc.blob=file;await store.put(doc);}
+  if(analysis.results.length){doc.results=analysis.results;doc.diagnostics=analysis.diagnostics;doc.notes=analysis.notes;doc.evidenceMap=analysis.evidenceMap;doc.source='PDF.js native / optional OCR';doc.blob=file;doc.terDefinition='total-expense-ratio-v1';await store.put(doc);}
   else if(!doc.blob){doc.blob=file;await store.put(doc);}
  }else if(!doc.blob){doc.blob=file;await store.put(doc);}
  await store.addToWorkspace(hash);
@@ -558,6 +1058,8 @@ async function processOne(entry,idx,total){
   if(currentBatchSelection===entry.id){active=doc;inspectDoc(doc);if(!doc.blob){$('result').querySelectorAll('button.locate').forEach(b=>b.disabled=false);}viewPdf(doc.blob||entry.file);}
  }catch(e){entry.state='failed';entry.error=e.message||String(e);entry.message=entry.error;console.error('Batch document failed',entry.file.name,e);}
  updateBatchDisplay();
+ if(dataFilterState.active)await refreshDataFilterResults();
+ else await refreshFilterDocumentCache();
 }
 async function processBatch(){
  if(busy)return;
@@ -583,6 +1085,7 @@ async function retryBatchEntry(id){
 function updateHistoryReturn(){
  $('historyReturn').classList.toggle('hidden',!openedFromHistory);
  if(openedFromHistory){$('historyStatus').textContent='Loaded from history: '+(active?.results?.[0]?.fund_name||active?.filename||'Saved document')+' · '+(active?.blob?'Original PDF available':'History loaded — original PDF not available.');}
+ updateDataFilterControls();
 }
 function dateLabel(d){return new Date(d.created||d.updated||0).toLocaleString();}
 function docFundName(d){return [...new Set((d.results||[]).map(r=>r.fund_name).filter(Boolean))].join(' · ')||d.filename||'Unnamed document';}
@@ -732,12 +1235,45 @@ function bind(){
  $('clearList').onclick=async()=>{
   if(busy||!await confirmClearList())return;
   await store.clearWorkspace();
-  await history();status('Recent Documents cleared — upload batch and saved History kept',0);
+  await history();
+  if(dataFilterState.active)await refreshDataFilterResults();
+  status('Recent Documents cleared — upload batch and saved History kept',0);
  };
+ $('removeFromList').onclick=()=>removeSelectedFromRecentList().catch(error);
  $('viewAllHistory').onclick=()=>{if(!busy)setPage('history');};
  for(const [id,scope] of [['download','current'],['exportAll','all'],['exportListed','listed']]){
   $(id).onclick=e=>{e.preventDefault();exportDocs(scope,'xlsx');};
  }
+ $('excelFilterOpen').onclick=()=>openExcelFilePicker();
+ $('excelFilterFile').onchange=event=>{
+  const file=event.target.files?.[0];
+  if(file)loadExcelFilterFile(file).catch(error);
+ };
+ $('excelFilterSheet').onchange=previewExcelFilterSheet;
+ $('excelFilterApply').onclick=applyExcelFilter;
+ $('excelFilterClose').onclick=()=>$('excelFilterDialog').close();
+ $('excelFilterCancel').onclick=()=>$('excelFilterDialog').close();
+ $('excelFilterDialog').addEventListener('click',event=>{if(event.target===$('excelFilterDialog'))$('excelFilterDialog').close();});
+ $('dataFilterOpen').onclick=async()=>{
+  try{
+   await refreshFilterDocumentCache();updateDataFilterControls();
+   if(!collectFilterDocuments().length){alert('Add or restore at least one document to Recent Documents before filtering.');return;}
+   $('dataFilterInput').value=dataFilterState.rawText||'';
+   $('dataFilterDialog').showModal();
+   $('dataFilterInput').focus();
+  }catch(e){error(e);}
+ };
+ $('dataFilterClose').onclick=()=>$('dataFilterDialog').close();
+ $('dataFilterCancel').onclick=()=>$('dataFilterDialog').close();
+ $('dataFilterClearInput').onclick=()=>{$('dataFilterInput').value='';$('dataFilterInput').focus();};
+ $('dataFilterApply').onclick=()=>{
+  if(applyDataFilter($('dataFilterInput').value))$('dataFilterDialog').close();
+ };
+ $('dataFilterClear').onclick=()=>resetDataFilter(true);
+ $('exportFiltered').onclick=exportFilteredResults;
+ $('dataFilterDialog').addEventListener('click',event=>{if(event.target===$('dataFilterDialog'))$('dataFilterDialog').close();});
+ $('dataFilterInput').addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter')$('dataFilterApply').click();});
+ updateDataFilterControls();
  const csvBtn=document.createElement('button');csvBtn.textContent='Export CSV';csvBtn.className='ghost';
  csvBtn.title='Export all saved results as CSV (single worksheet alternative)';
  csvBtn.onclick=()=>exportDocs('all','csv');
