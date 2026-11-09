@@ -196,5 +196,47 @@
     "profile": "profile_scotia",
     "extract": "extract_scotia",
     "file": "js/fmc/scotia.js"
+  },
+  {
+    "key": "capital_group",
+    "profile": "profile_capital_group",
+    "extract": "extract_capital_group",
+    "file": "js/fmc/capital_group.js"
+  },
+  {
+    "key": "arrow_capital",
+    "profile": "profile_arrow_capital",
+    "extract": "extract_arrow_capital",
+    "file": "js/fmc/arrow_capital.js"
+  },
+  {
+    "key": "guardian",
+    "profile": "profile_guardian",
+    "extract": "extract_guardian",
+    "file": "js/fmc/guardian.js"
+  },
+  {
+    "key": "beutel_goodman",
+    "profile": "profile_beutel_goodman",
+    "extract": "extract_beutel_goodman",
+    "file": "js/fmc/beutel_goodman.js"
+  },
+  {
+    "key": "canada_life",
+    "profile": "profile_canada_life",
+    "extract": "extract_canada_life",
+    "file": "js/fmc/canada_life.js"
+  },
+  {
+    "key": "ccl",
+    "profile": "profile_ccl",
+    "extract": "extract_ccl",
+    "file": "js/fmc/ccl.js"
+  },
+  {
+    "key": "sei",
+    "profile": "profile_sei",
+    "extract": "extract_sei",
+    "file": "js/fmc/sei.js"
   }
 ]
