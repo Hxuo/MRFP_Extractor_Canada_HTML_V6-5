@@ -94,11 +94,15 @@ function identifyFund(pages,p){
  return issuerTitleCandidate(pages,p)?.text||'Unknown Fund';
 }
 
-function makeRow(cls,p,fund,date,vals,ev,needsReview=false){
+function makeRow(cls,p,fund,date,vals,ev,needsReview=false,metadata=null){
  const year=date?Number(date.slice(0,4)):null;
  const fid=createHash('sha256').update(p.key+'\0'+fund.toLowerCase()).digest('hex').slice(0,20);
+ // Stable row identity is based on the canonical class, never a display note
+ // such as a historical re-designation appended by an issuer adapter.
  const cid=createHash('sha256').update(fid+'\0'+cls.toLowerCase()).digest('hex').slice(0,20);
- return {class_name:cls,fund_name:fund,fmc:p.label,fmc_key:p.key,fund_id:fid,class_id:cid,row_id:cid+':'+(date||year||'unknown'),report_date:date,year,MER:vals.MER??null,TER:vals.TER??null,PTR:vals.PTR??null,evidence:ev,needs_review:needsReview||!date};
+ const displayClass=metadata?.displayClassName||cls;
+ const aliases=Array.isArray(metadata?.classAliases)?[...new Set(metadata.classAliases.map(x=>String(x||'').trim()).filter(Boolean))]:[];
+ return {class_name:displayClass,...(metadata?.displayClassName?{class_identity:cls}:{}),...(aliases.length?{class_aliases:aliases}:{}),fund_name:fund,fmc:p.label,fmc_key:p.key,fund_id:fid,class_id:cid,row_id:cid+':'+(date||year||'unknown'),report_date:date,year,MER:vals.MER??null,TER:vals.TER??null,PTR:vals.PTR??null,evidence:ev,needs_review:needsReview||!date};
 }
 function findMetric(block,metric){
  const lines=block.split(/\r?\n/);
