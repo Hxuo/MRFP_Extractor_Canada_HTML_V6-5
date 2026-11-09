@@ -2,10 +2,10 @@
 const METRICS=['MER','TER','PTR'];
 const LABELS={
  MER:/\b(?:management\s+(?:expense|expenses)\s+ratio|management\s+expense|MER)\b/i,
- TER:/\b(?:trading\s+(?:expense|expenses)\s+ratio|trading\s+expenses?|TER)\b/i,
+ TER:/\btotal\s+expense\s+ratio\b/i,
  PTR:/\b(?:portfolio\s+turnover(?:\s+(?:rate|ratio))?|turnover\s+(?:rate|ratio)|PTR)\b/i
 };
-const RATIO_SECTION=/ratios?\s+(?:and|&)\s+supplemental|financial\s+(?:highlights|ratios)|management\s+expense|trading\s+expense|portfolio\s+turnover|\bMER\b|\bTER\b/i;
+const RATIO_SECTION=/ratios?\s+(?:and|&)\s+supplemental|financial\s+(?:highlights|ratios)|management\s+expense|trading\s+expense|total\s+expense\s+ratio|portfolio\s+turnover|\bMER\b|\bTER\b/i;
 const clean=s=>String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim().toLowerCase();
 const almost=(a,b)=>Number.isFinite(Number(a))&&Number.isFinite(Number(b))&&Math.abs(Number(a)-Number(b))<.000001;
 const category=s=>/ETF|Units/i.test(s||'')?'units':'series';
