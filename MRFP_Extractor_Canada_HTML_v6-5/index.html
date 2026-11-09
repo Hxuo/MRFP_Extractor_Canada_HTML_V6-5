@@ -2,7 +2,7 @@
 <link rel="icon" type="image/png" href="./Assets/Icons/LSEG.jpg">
 <link rel="stylesheet" href="css/style.css"></head><body>
 <header class="app-header">
-  <div class="app-brand"><h1>MRFP Extractor Canada <span>Browser v6-5</span></h1><small>Automated Management Expense · Trading Expense · Portfolio Turnover</small></div>
+  <div class="app-brand"><h1>MRFP Extractor Canada <span>Browser v6-5</span></h1><small>Automated Management Expense · Total Expense Ratio · Portfolio Turnover</small></div>
   <nav class="topnav" aria-label="Main navigation">
     <button type="button" class="nav-btn is-active" data-page="extract" aria-current="page"><span aria-hidden="true">▤</span> Extract</button>
     <button type="button" class="nav-btn" data-page="history"><span aria-hidden="true">◷</span> History</button>
@@ -21,23 +21,23 @@
 <div id="historyReturn" class="history-return hidden"><button type="button" id="backToHistory" class="ghost">← Back to History</button><span id="historyStatus"></span></div>
 <main><section class="pane">
     
-<div class="sectiontitle">
-  <h2>Extraction results</h2>
-
-    <div class="export-actions">
-        <a id="download" class="hidden" href="#">
-            Export Data ↓
-        </a>
-
-        <a id="exportAll" href="#">
-            Export All Data ↓
-        </a>
-
-        <a id="exportListed" class="hidden" href="#" title="Export every fund currently in Recent Documents">
-            Export All Listed ↓
-        </a>
-</div>
-
+<div class="sectiontitle results-sectiontitle">
+  <div class="results-title-tools">
+    <h2>Extraction results</h2>
+    <button id="dataFilterOpen" class="data-filter-trigger" type="button" disabled title="Extract at least one PDF to enable filtering">
+      Filter using Data Needed Only
+    </button>
+    <button id="excelFilterOpen" class="data-filter-trigger" type="button" disabled title="Upload an Excel list of Asset IDs and Fund Names">Upload Filtered List</button>
+    <button id="dataFilterClear" class="data-filter-clear hidden" type="button" title="Return to all extracted results">
+      Clear Filter
+    </button>
+  </div>
+  <div class="export-actions" aria-label="Export extraction results">
+    <a id="download" class="hidden" href="#">Export Data ↓</a>
+    <a id="exportAll" href="#">Export All Data ↓</a>
+    <a id="exportListed" class="hidden" href="#" title="Export every fund currently in Recent Documents">Export All Listed ↓</a>
+    <button id="exportFiltered" type="button" disabled title="Apply a filter with matching results first">Export Filtered ↓</button>
+  </div>
 </div>
 
 <div id="overview" class="empty"><div class="emptyIcon">▤</div>Upload a fund report and click <b>Extract ratios</b>.<br><small>MER, TER and portfolio turnover are detected automatically.</small></div>
@@ -89,6 +89,7 @@
     <div class="recent-heading-label"><h2 id="recentDocumentsTitle">Recent Documents</h2><span id="recentCount" class="recent-count">0 listed</span></div>
     <div class="history-controls">
       <button id="reloadHistory" class="ghost" type="button">Refresh</button>
+      <button id="removeFromList" class="ghost" type="button" disabled title="Select a document in Recent Documents first">Remove from the list</button>
       <button id="clearList" class="ghost" type="button">Clear List</button>
     </div>
   </div>
@@ -104,6 +105,56 @@
  <div id="evidenceStatus" class="evidence-status" role="status" aria-live="polite"></div>
  <div id="evidenceScroll" class="evidence-scroll"><div id="evidencePages" class="evidence-pages"></div></div>
  </div><iframe id="viewer" class="hidden" title="Original PDF fallback preview"></iframe><div id="pdfUnavailable" class="pdf-unavailable hidden" role="status">No PDF selected.</div></section></main>
+<dialog id="dataFilterDialog" class="data-filter-dialog" aria-labelledby="dataFilterTitle" aria-describedby="dataFilterDescription">
+  <div class="filter-dialog-head">
+    <div>
+      <h2 id="dataFilterTitle">Filter using Data Needed Only</h2>
+      <p id="dataFilterDescription">Paste your required fund names below, one entry per line. Numeric Lipper IDs are ignored for matching but retained in Export Filtered; matching is based on the fund name and optional Class / Series.</p>
+    </div>
+    <button id="dataFilterClose" class="filter-dialog-close" type="button" aria-label="Close filter">×</button>
+  </div>
+  <label class="filter-input-label" for="dataFilterInput">Required fund names</label>
+  <textarea id="dataFilterInput" rows="10" spellcheck="false" placeholder="67987654    NBI Global Equity Fund F&#10;NBI Canadian Equity Private Portfolio&#10;Meritage Canadian Equity Portfolio"></textarea>
+  <p class="filter-dialog-hint">You may paste names with or without a Lipper ID. The ID is retained for CSV export but never used for matching. A fund-only entry includes all its extracted classes.</p>
+  <div class="filter-dialog-actions">
+    <button id="dataFilterClearInput" class="ghost" type="button">Clear List</button>
+    <span class="filter-dialog-spacer"></span>
+    <button id="dataFilterCancel" class="ghost" type="button">Cancel</button>
+    <button id="dataFilterApply" class="filter-blue-button" type="button">Filter Result</button>
+  </div>
+</dialog>
+<input id="excelFilterFile" type="file" accept=".xlsx,.xlsm,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel.sheet.macroEnabled.12,application/vnd.ms-excel,text/csv" hidden aria-label="Choose Excel or CSV fund list">
+<dialog id="excelFilterDialog" class="data-filter-dialog excel-import-dialog" aria-labelledby="excelFilterTitle" aria-describedby="excelFilterDescription">
+  <div class="filter-dialog-head">
+    <div>
+      <h2 id="excelFilterTitle">Excel Import Summary</h2>
+      <p id="excelFilterDescription">Review the detected Asset ID and Fund Name columns before applying the existing Data Needed Only filter.</p>
+      <p id="excelFilterFileName" class="excel-file-name">No file selected</p>
+    </div>
+    <button id="excelFilterClose" class="filter-dialog-close" type="button" aria-label="Close Excel import summary">×</button>
+  </div>
+  <div id="excelFilterSheetRow" class="excel-sheet-row hidden">
+    <label class="filter-input-label" for="excelFilterSheet">Worksheet</label>
+    <select id="excelFilterSheet" aria-label="Worksheet to filter from"></select>
+  </div>
+  <p id="excelFilterStatus" class="excel-filter-status" role="status" aria-live="polite">Select a file to see the import summary.</p>
+  <div id="excelFilterPreview" class="excel-filter-preview" aria-label="Excel import preview"></div>
+  <div class="excel-format-support" aria-label="Supported file formats">
+    <p class="excel-import-section-label">Supported formats</p>
+    <div class="excel-format-grid">
+      <div class="excel-format-item"><strong>.xlsx</strong><span>— Standard Excel</span><b>Supported</b></div>
+      <div class="excel-format-item"><strong>.xls</strong><span>— Older Excel</span><b>Supported</b></div>
+      <div class="excel-format-item"><strong>.xlsm</strong><span>— Macro-enabled Excel</span><b>Supported</b></div>
+      <div class="excel-format-item"><strong>.csv</strong><span>— CSV files</span><b>Supported</b></div>
+    </div>
+    <p class="filter-dialog-hint">Files are read locally. Macros and formulas are never executed. Password-protected files are not supported.</p>
+  </div>
+  <div class="filter-dialog-actions">
+    <span class="filter-dialog-spacer"></span>
+    <button id="excelFilterCancel" class="ghost" type="button">Cancel</button>
+    <button id="excelFilterApply" class="filter-blue-button" type="button" disabled>Confirm and Filter Result</button>
+  </div>
+</dialog>
 </div><!-- extractPage -->
 <section id="historyPage" class="app-page content-page hidden" aria-labelledby="historyTitle">
   <div class="page-heading"><div><h2 id="historyTitle">Extraction History</h2><p>Search, review, and manage saved MRFP documents in this browser.</p></div><button id="historyRefresh" class="ghost" type="button">↻ Refresh</button></div>
@@ -201,6 +252,30 @@
   </div>
 </dialog>
 
+<!-- REMOVE ONE SELECTED DOCUMENT FROM RECENT DOCUMENTS -->
+<dialog id="removeFromListModal" class="settings-dialog action-confirm-dialog" aria-labelledby="removeFromListTitle">
+  <div class="dialog-head">
+    <div>
+      <h2 id="removeFromListTitle">Remove from Recent Documents?</h2>
+      <p class="muted">You are removing one selected document from the Recent Documents list.</p>
+    </div>
+    <button type="button" class="dialog-close" id="removeFromListClose" aria-label="Cancel">×</button>
+  </div>
+  <div class="action-confirm-body">
+    <div class="action-hint">
+      <span class="action-hint-icon">i</span>
+      <div>
+        <p><strong id="removeFromListFund">Selected fund</strong></p>
+        <p id="removeFromListFile" class="muted"></p>
+        <p>This only removes the selected entry from Recent Documents. Saved History, extracted results, manual corrections, verification records, and the stored PDF will remain available. You can restore it from History later.</p>
+      </div>
+    </div>
+  </div>
+  <div class="dialog-actions action-dialog-actions">
+    <button type="button" id="removeFromListCancel" class="ghost">Cancel</button>
+    <button type="button" id="removeFromListProceed" class="danger-button">Remove from the list</button>
+  </div>
+</dialog>
 
 <!-- RE-SCAN CONFIRMATION MODAL -->
 <dialog
@@ -284,4 +359,5 @@
 <script defer src="js/excel-export.js"></script>
 <script defer src="js/evidence-locator.js"></script>
 <script defer src="js/evidence-viewer.js"></script>
+<script defer src="js/filter-excel.js"></script>
 <script defer src="js/app.js"></script></body></html>
