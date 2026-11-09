@@ -5,10 +5,10 @@
 const METRICS=['MER','TER','PTR'];
 const LABELS={
  MER:/\b(?:management\s+(?:expense|expenses)\s+ratio|management\s+expense|MER)\b/i,
- TER:/\b(?:trading\s+(?:expense|expenses)\s+ratio|trading\s+expenses?|TER)\b/i,
+ TER:/\btotal\s+expense\s+ratio\b/i,
  PTR:/\b(?:portfolio\s+turnover(?:\s+(?:rate|ratio))?|turnover\s+(?:rate|ratio)|PTR)\b/i
 };
-const RATIO_SECTION=/ratios?\s+(?:and|&)\s+supplemental|financial\s+(?:highlights|ratios)|management\s+expense|trading\s+expense|portfolio\s+turnover|\bMER\b|\bTER\b/i;
+const RATIO_SECTION=/ratios?\s+(?:and|&)\s+supplemental|financial\s+(?:highlights|ratios)|management\s+expense|trading\s+expense|total\s+expense\s+ratio|portfolio\s+turnover|\bMER\b|\bTER\b/i;
 const clean=s=>String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim().toLowerCase();
 const almost=(a,b)=>Number.isFinite(Number(a))&&Number.isFinite(Number(b))&&Math.abs(Number(a)-Number(b))<.000001;
 const category=s=>/ETF|Units/i.test(s||'')?'units':'series';
@@ -478,6 +478,107 @@ function gapDocIdentity(pages,row){
  return pages.some(p=>dateRx.test(p.text)||reverseRx.test(p.text));
 }
 
+/* Office TER contract (v6-5): TER = explicitly published TOTAL EXPENSE RATIO.
+ * Trading Expense Ratio and FER are never interchangeable with this metric.
+ * Strict generic evidence-backed support for single-period/column financial tables.
+ * Unrecognized layouts fail closed; issuers can add verified layout support later.
+ * This is included in BOTH generated bundles to avoid extraction/locator drift. */
+const TOTAL_EXPENSE_RATIO_DEFINITION='total-expense-ratio-v1';
+const TOTAL_EXPENSE_RATIO_LABEL=/^total\s+expense\s+ratios?\b/i;
+const TOTAL_EXPENSE_LINES_CACHE=new WeakMap();
+
+function totalExpenseNormalize(s){return String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim();}
+function totalExpenseClassHeading(s){
+ const t=totalExpenseNormalize(s).replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g,'').replace(/(?:\s*\(\d+\))+\s*$/,'').trim();
+ const m=/^(?:(?:Series|Class)\s+[A-Z][A-Z0-9-]*|[A-Z][A-Z0-9-]*\s+(?:Shares?|Units?)|(?:ETF|CAD|USD)\s+(?:Series|Units?))\b/i.exec(t);
+ if(!m)return null;
+ const rest=t.slice(m[0].length).trim();
+ return !rest||/^(?:\*+|\(\d+\)|\(\d+\)\s*\(\d+\))$/.test(rest)?m[0].toLowerCase().replace(/\s+/g,' '):null;
+}
+function totalExpensePageLines(items){
+ const result=[];
+ for(const it of items||[]){
+  if(typeof it.str!=='string'||!it.str.trim()||!Number.isFinite(it.x)||!Number.isFinite(it.y))continue;
+  const h=Math.max(5,Number(it.h)||8);
+  let line=result.find(l=>Math.abs(l.y-it.y)<Math.max(1.5,Math.min(2.8,h*.25)));
+  if(!line){line={y:it.y,items:[]};result.push(line);}
+  line.items.push(it);
+ }
+ for(const l of result){l.items.sort((a,b)=>a.x-b.x);l.text=totalExpenseNormalize(l.items.map(it=>it.str).join(' '));}
+ return result.sort((a,b)=>b.y-a.y);
+}
+function totalExpenseCell(item){
+ const raw=String(item.str||'').trim().replace(/\s+/g,'');
+ if(/^[-–—−]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return {value:null,isMissing:true,raw};
+ if(!/^(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)\s*%?$/.test(raw))return null;
+ const n=Number(raw.replace(/[,%]/g,''));
+ return Number.isFinite(n)&&n>=0&&n<=100?{value:n,isMissing:false,raw}:null;
+}
+function totalExpenseClassMatches(found,expected){
+ const normalize=s=>totalExpenseNormalize(s).toLowerCase().replace(/\s+/g,' ');
+ return normalize(found)===normalize(expected);
+}
+function totalExpenseRatioSource(pages,row){
+ const year=Number(String(row?.report_date||'').slice(0,4))||Number(row?.year);
+ const className=row?.class_identity||row?.class_name;
+ if(!year||year<2000||year>2100||!className)return null;
+ const hits=[];
+ for(const page of pages||[]){
+  if(page?.ocrUsed||!Array.isArray(page?.items)||!page.items.length)continue;
+  // Most MRFPs do not publish this metric. Avoid building text geometry
+  // repeatedly for every class when the explicit label is not present.
+  if(page.text&&!/\btotal\s+expense\s+ratios?\b/i.test(page.text))continue;
+  let lines=TOTAL_EXPENSE_LINES_CACHE.get(page);
+  if(!lines){lines=totalExpensePageLines(page.items);TOTAL_EXPENSE_LINES_CACHE.set(page,lines);}
+  for(let ix=0;ix<lines.length;ix++){
+   const metric=lines[ix];
+   if(!TOTAL_EXPENSE_RATIO_LABEL.test(metric.text))continue;
+   // This must be a named financial-table row, not an explanatory paragraph,
+   // a calculated FER, or a before-waivers Total Expense Ratio variant.
+   const label=TOTAL_EXPENSE_RATIO_LABEL.exec(metric.text)[0];
+   const tail=metric.text.slice(label.length).trim();
+   if(/^(?:before|excluding|including|plus|less|and)\b/i.test(tail))continue;
+   // Require a physically distinct percentage cell, never a number guessed
+   // from a text run containing the entire heading and surrounding prose.
+   let accumulated='',labelRight=null;
+   for(const it of metric.items){
+    accumulated=totalExpenseNormalize(accumulated+' '+it.str);
+    if(!TOTAL_EXPENSE_RATIO_LABEL.test(accumulated))continue;
+    labelRight=it.x+(Number(it.w)||0);
+    break;
+   }
+   if(!Number.isFinite(labelRight))continue;
+   const explicitCells=metric.items.filter(it=>it.x>labelRight+2.5).map(it=>{
+    const parsed=totalExpenseCell(it);
+    if(!parsed||!Number.isFinite(it.w)||it.w<=0)return null;
+    return {...parsed,x:it.x,y:it.y,box:{x:Math.max(0,it.x-1),y:it.y-1,w:it.w+2,h:Math.max(6,it.h||8)+2}};
+   }).filter(Boolean);
+   if(!explicitCells.length)continue;
+   // Determine the NEAREST preceding class or series heading. A different
+   // class heading blocks using an identical number from the wrong class.
+   const precedingClasses=lines.slice(Math.max(0,ix-45),ix).map(l=>{
+    const firstX=l.items[0]?.x??0;
+    const headingText=l.items.filter(it=>it.x<firstX+230&&!/^20\d\d$/.test(it.str.trim())).slice(0,6).map(it=>it.str).join(' ');
+    return {name:totalExpenseClassHeading(headingText),y:l.y};
+   }).filter(x=>x.name&&x.y>metric.y&&x.y-metric.y<310).sort((a,b)=>a.y-b.y);
+   if(!precedingClasses.length||!totalExpenseClassMatches(precedingClasses[0].name,className))continue;
+   // Require the exact document reporting year printed above the cell in
+   // the SAME column. Other-year figures or first-column assumptions fail.
+   const printedYears=lines.slice(Math.max(0,ix-45),ix).flatMap(l=>l.items.filter(it=>/^20\d\d$/.test(it.str.trim())&&l.y>metric.y&&l.y-metric.y<310).map(it=>({year:Number(it.str.trim()),x:it.x,y:l.y})));
+   for(const cell of explicitCells){
+    const yearMarkers=printedYears.filter(it=>Math.abs(it.x-cell.x)<25);
+    if(!yearMarkers.length)continue;
+    yearMarkers.sort((a,b)=>a.y-b.y);
+    // If two year rows share one x, the closest header determines the period.
+    if(yearMarkers[0].year!==year)continue;
+    hits.push({page:page.page,value:cell.value,box:cell.box,raw:cell.raw,isMissing:cell.isMissing,kind:'strict-total-expense-ratio-cell'});
+   }
+  }
+ }
+ // Multiple possible cells are ambiguous. Do not select by number alone.
+ return hits.length===1?hits[0]:null;
+}
+
 // Legacy saved-record stamps are retained exactly for History compatibility.
 const evidencePolicy_nbi={stamps:{fmcEvidenceVersion:1}};
 function nbiCell(page,lines,row,key,value){
@@ -487,13 +588,18 @@ function nbiCell(page,lines,row,key,value){
  if(!clean(page.text||'').includes(clean(row.fund_name)))return null;
  const canonical=s=>clean(s).replace(/[†*®™]/g,'').replace(/[^a-z0-9]+/g,' ').trim();
  const expected=canonical(row.class_name);
- const seriesHeading=t=>/^(?:(?:investor(?:-\d+)?\s*\/\s*advisor(?:-\d+)?\s+series)|(?:(?:investor|advisor)(?:-\d+)?\s+series)|(?:private\s+series)|(?:series\s+[a-z][a-z0-9-]*)|(?:etfh?\s+series))$/i.test(t.trim().replace(/[†*]/g,''));
+ const normalizedHeading=t=>String(t||'').replace(/[†*]/g,'').replace(/\s+/g,' ').trim();
+ const sharedHeadingParts=t=>{
+  const match=/^(Series\s+[a-z][a-z0-9-]*)\s*\/\s*(Private\s+Series)$/i.exec(normalizedHeading(t));
+  return match?[match[1],match[2]]:[];
+ };
+ const seriesHeading=t=>/^(?:(?:investor(?:-\d+)?\s*\/\s*advisor(?:-\d+)?\s+series)|(?:(?:investor|advisor)(?:-\d+)?\s+series)|(?:private\s+series)|(?:series\s+[a-z][a-z0-9-]*)|(?:etfh?\s+series))$/i.test(normalizedHeading(t))||sharedHeadingParts(t).length>0;
  const headings=lines.filter(l=>seriesHeading(l.text));
  const label={MER:/^Management\s+expense\s+ratio\s*\(%\)$/i,TER:/^Trading\s+expense\s+ratio\s*\(%\)$/i,PTR:/^Portfolio\s+turnover\s+rate\s*\(%\)$/i}[key];
  const output=[];
  for(const section of lines.filter(l=>/^Ratios\s+(?:and|&)\s+Supplemental\s+Data\s*$/i.test(l.text))){
   const prev=headings.filter(l=>l.y>section.y&&l.y-section.y<520).sort((a,b)=>a.y-b.y)[0];
-  if(!prev||canonical(prev.text)!==expected)continue;
+  if(!prev||![normalizedHeading(prev.text),...sharedHeadingParts(prev.text)].some(t=>canonical(t)===expected))continue;
   const end=Math.max(section.y-130,0);
   const block=lines.filter(l=>l.y<section.y&&l.y>end);
   const periods=block.filter(l=>/\bAccounting\s+Period\s+Ended\b/i.test(l.text));
@@ -1700,10 +1806,514 @@ function scotiaCell(page,lines,row,key,value){
 
 function locateCell_scotia(page,lines,row,key,value,context){const selected=scotiaCell(page,lines,row,key,value);return selected?{...selected,page:page.page,metric:key,kind:row.fmc_key+'-verified-series-period-header-cell'}:null;}
 
-const FMC_EVIDENCE_HANDLERS={"nbi":locateCell_nbi,"desjardins":locateCell_desjardins,"franklin":locateCell_franklin,"manulife":locateCell_manulife,"dynamic":locateCell_dynamic,"purpose":locateCell_purpose,"blackrock":locateCell_blackrock,"rbc":locateCell_rbc,"bmo":locateCell_bmo,"bmg":locateCell_bmg,"td":locateCell_td,"lysander":locateCell_lysander,"nei":locateCell_nei,"mackenzie":locateCell_mackenzie,"ig_mackenzie":locateCell_ig_mackenzie,"fidelity":locateCell_fidelity,"pender":locateCell_pender,"brandes":locateCell_brandes,"agf":locateCell_agf,"vanguard":locateCell_vanguard,"hamilton":locateCell_hamilton,"newgen":locateCell_newgen,"rpia":locateCell_rpia,"leith_wheeler":locateCell_leith_wheeler,"ci":locateCell_ci,"scotia":locateCell_scotia};
+// New FMC-local stamp; no changes to other managers' History/Restore policies.
+const evidencePolicy_capital_group={stamps:{capitalGroupRatioLocatorVersion:1}};
+function validateDocumentEvidence_capital_group(pages,row){
+ const name=String(row?.fund_name||'').toLowerCase();
+ return /^capital group\s+.+\s+(?:fund|etf)\s*\(canada\)$/.test(name)&&
+   pages.some(p=>String(p.text||'').toLowerCase().includes(name));
+}
+function locateCell_capital_group(page,lines,row,key,value,context){
+ if(key!=='MER'&&key!=='PTR'||value===null||value===undefined||
+    !String(page.text||'').toLowerCase().includes(String(row.fund_name||'').toLowerCase()))return null;
+ const r=/^(20\d\d)-(\d\d)-(\d\d)$/.exec(row.report_date||'');
+ if(!r)return null;
+ const targetDate=`${Number(r[2])}/${Number(r[3])}/${r[1]}`;
+ const sections=lines.filter(l=>/^Ratios and Supplemental Data\b/i.test(l.text));
+ if(sections.length!==1)return null;
+ const section=sections[0];
+ const headers=lines.filter(l=>l.y<section.y&&section.y-l.y<85)
+  .filter(l=>/Management\s+Before Waivers or\s+Trading\s+Portfolio\s+Net Asset/i.test(l.text));
+ if(headers.length!==1)return null;
+ const head=headers[0];
+ const anchor=t=>head.items.filter(it=>it.str.trim()===t);
+ const management=anchor('Management'),before=anchor('Before Waivers or'),trading=anchor('Trading'),portfolio=anchor('Portfolio'),nav=anchor('Net Asset');
+ if([management,before,trading,portfolio,nav].some(a=>a.length!==1))return null;
+ const [mx,bx,tx,px,nx]=[management[0],before[0],trading[0],portfolio[0],nav[0]].map(it=>it.x);
+ if(!(mx+25<bx&&bx+25<tx&&tx+25<px&&px+25<nx))return null;
+ const expectedClass=String(row.class_name||'');
+ const isEtf=/^ETF Units$/i.test(expectedClass)&&/\bETF\s*\(Canada\)$/i.test(row.fund_name||'');
+ if(!isEtf&&!/^Series\s+[A-Z](?:\d+)?$/i.test(expectedClass))return null;
+ const dated=lines.filter(l=>l.y<headers[0].y&&
+   new RegExp('^(?:Period|Year) ended\\s+'+targetDate.replaceAll('/','\\/')+'(?:\\s|$)','i').test(l.text));
+ const matches=[];
+ for(const current of dated){
+  if(current.y<20||current.y>section.y-45)continue;
+  const preceding=lines.filter(l=>l.y>current.y&&l.y<section.y&&
+     /^Series\s+[A-Z](?:\d+)?\s*$/i.test(l.text.trim())).sort((a,b)=>a.y-b.y);
+  if(isEtf){if(preceding.length)continue;}
+  else if(!preceding.length||preceding[0].text.trim().toLowerCase()!==expectedClass.toLowerCase())continue;
+  const lower=key==='MER'?mx-5:px-5;
+  const upper=key==='MER'?bx-10:nx-10;
+  const c=cells(current).filter(c=>c.x>=lower&&c.x<upper&&matchesCell(c,value));
+  if(c.length!==1)continue;
+  // Require adjacent printed ratio columns, not just an isolated number.
+  const ratioVals=cells(current);
+  if(!ratioVals.some(z=>z.x>=bx-5&&z.x<tx-10)||
+     !ratioVals.some(z=>z.x>=tx-5&&z.x<px-10))continue;
+  matches.push(c[0]);
+ }
+ const unique=new Map(matches.map(c=>[c.box.x.toFixed(2)+':'+c.box.y.toFixed(2),c]));
+ if(unique.size!==1)return null;
+ return {...[...unique.values()][0],page:page.page,metric:key,kind:'capital-group-verified-current-series-and-metric-column'};
+}
+
+const evidencePolicy_arrow_capital={stamps:{arrowCapitalEvidenceVersion:1}};
+function arrowCapitalEvidenceNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s*-\s*/g,'-').replace(/\s+/g,' ').trim();
+}
+function arrowCapitalEvidenceCompact(value){
+ return arrowCapitalEvidenceNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+function arrowCapitalEvidenceSeriesHeading(line){
+ const text=arrowCapitalEvidenceNormalize(line).toUpperCase();
+ const match=/^SERIES\s+([A-Z][A-Z0-9]*)\s*(?:\(\s*RE-DESIGNATED\s+FROM\s+([A-Z0-9][A-Z0-9 ]*?)\s*\))?$/.exec(text);
+ return match?{cls:`Series ${match[1].toUpperCase()}`}:null;
+}
+function validateDocumentEvidence_arrow_capital(pages,row){
+ const manager=(pages||[]).slice(0,3).some(page=>/Arrow\s+Capital\s+Management\s+Inc\.?/i.test(page.text||''));
+ const fund=arrowCapitalEvidenceCompact(row?.fund_name);
+ return manager&&fund&&pages.some(page=>arrowCapitalEvidenceCompact(page.text||'').includes(fund));
+}
+function locateCell_arrow_capital(page,lines,row,key,value,context){
+ if(!['MER','PTR'].includes(key)||value===null||value===undefined||
+    !arrowCapitalEvidenceCompact(page.text||'').includes(arrowCapitalEvidenceCompact(row.fund_name)))return null;
+ const year=Number(String(row.report_date||'').slice(0,4));if(!year)return null;
+ const sections=lines.filter(line=>/^Ratios\s+and\s+Supplemental\s+Data\b/i.test(line.text));
+ if(sections.length!==1)return null;
+ const section=sections[0];
+ const yearLines=lines.filter(line=>line.y>section.y&&line.y-section.y<42&&
+  line.items.some(item=>new RegExp('^'+year+'(?:†)?$').test(String(item.str||'').trim())));
+ if(yearLines.length!==1)return null;
+ const yearItem=yearLines[0].items.find(item=>new RegExp('^'+year+'(?:†)?$').test(String(item.str||'').trim()));
+ if(!yearItem)return null;
+ const yearCenter=yearItem.x+(Number(yearItem.w)||0)/2;
+ const headings=lines.filter(line=>line.y>yearLines[0].y&&line.y-yearLines[0].y<48)
+  .map(line=>({line,heading:arrowCapitalEvidenceSeriesHeading(line.text)})).filter(item=>item.heading);
+ if(headings.length!==1)return null;
+ const expected=String(row.class_identity||row.class_name||'').trim().toLowerCase();
+ if(headings[0].heading.cls.toLowerCase()!==expected)return null;
+ const labelPattern=key==='MER'?/^Management\s+expense\s+ratio\b(?!\s+before\b)/i:/^Portfolio\s+turnover\s+rate\b/i;
+ const metricLines=lines.filter(line=>line.y<section.y&&section.y-line.y<165&&labelPattern.test(line.text));
+ if(metricLines.length!==1)return null;
+ const line=metricLines[0];
+ const candidates=cells(line).filter(cell=>matchesCell(cell,value)&&
+  Math.abs((cell.box.x+cell.box.w/2)-yearCenter)<20);
+ if(candidates.length!==1)return null;
+ return {...candidates[0],page:page.page,metric:key,kind:'arrow-capital-current-period-series-ratio-cell'};
+}
+
+function guardianEvidenceNormalize(s){return String(s||'').normalize('NFKC').replace(/\u00ad/g,'').replace(/™|®|\bTM\b|TM(?=\s)/gi,'').replace(/\s+/g,' ').trim();}
+function guardianEvidenceCompact(s){return guardianEvidenceNormalize(s).toLowerCase().replace(/[^a-z0-9]/g,'');}
+function guardianEvidenceClassFromHeading(line){
+ const text=guardianEvidenceNormalize(line);
+ const m=/^Ratios?\s+(?:and|&)\s+Supplemental\s+Data\s*\((.+)\)\s*$/i.exec(text);
+ if(!m)return null;
+ return guardianEvidenceNormalize(m[1]).replace(/\s*\(formerly\b[^)]*\)\s*$/i,'').trim();
+}
+function guardianEvidenceFundMatches(text,fundName){
+ const source=guardianEvidenceCompact(String(text||'').slice(0,2800));
+ const target=guardianEvidenceCompact(fundName);
+ if(target&&source.includes(target))return true;
+ // Some PDF.js builds place a one-digit superscript in a separate text run.
+ const targetLetters=target.replace(/\d/g,'');
+ const sourceLetters=source.replace(/\d/g,'');
+ const digits=String(fundName||'').match(/\d+/g)||[];
+ return targetLetters.length>12&&sourceLetters.includes(targetLetters)&&digits.every(d=>source.includes(d));
+}
+function guardianEvidenceDateCenter(lines,section,iso){
+ const monthNames=['January','February','March','April','May','June','July','August','September','October','November','December'];
+ const month=monthNames[Number(iso[2])-1],day=Number(iso[3]),year=iso[1],prefix=month.slice(0,3)+'[a-z]*';
+ const fullRx=new RegExp('^'+prefix+'\\.?\\s+'+day+',?\\s+'+year+'$','i');
+ const monthDayRx=new RegExp('^'+prefix+'\\.?\\s+'+day+',?$','i');
+ const monthOnlyRx=new RegExp('\\b'+prefix+'\\b','i');
+ const dayYearRx=new RegExp('^'+day+',?\\s+'+year+'$','i');
+ const yearRx=new RegExp('^'+year+'$');
+ const nearby=lines.filter(l=>l.y<section.y&&section.y-l.y<145).flatMap(l=>l.items);
+ const center=it=>tokenCenter(it);
+ const direct=nearby.filter(it=>fullRx.test(guardianEvidenceNormalize(it.str)));
+ if(direct.length===1)return center(direct[0]);
+ if(direct.length>1)return null;
+ const dateItems=nearby.filter(it=>monthDayRx.test(guardianEvidenceNormalize(it.str)));
+ const monthItems=nearby.filter(it=>monthOnlyRx.test(guardianEvidenceNormalize(it.str)));
+ const dayYearItems=nearby.filter(it=>dayYearRx.test(guardianEvidenceNormalize(it.str)));
+ const yearItems=nearby.filter(it=>yearRx.test(guardianEvidenceNormalize(it.str)));
+ const centers=[];
+ for(const d of dateItems)for(const y of yearItems)
+  if(Math.abs(center(d)-center(y))<22&&Math.abs(d.y-y.y)<40)centers.push(center(y));
+ for(const m of monthItems)for(const dy of dayYearItems)
+  if(Math.abs(center(m)-center(dy))<22&&Math.abs(m.y-dy.y)<40)centers.push(center(dy));
+ const unique=[...new Set(centers.map(x=>Math.round(x*10)/10))];
+ return unique.length===1?unique[0]:null;
+}
+const evidencePolicy_guardian={stamps:{guardianRatioLocatorVersion:1}};
+function validateDocumentEvidence_guardian(pages,row){
+ return pages.slice(0,5).some(p=>guardianEvidenceFundMatches(p.text,row?.fund_name));
+}
+function locateCell_guardian(page,lines,row,key,value,context){
+ if(key!=='MER'&&key!=='PTR'||!Array.isArray(page.items)||page.ocrUsed)return null;
+ if(!guardianEvidenceFundMatches(page.text,row.fund_name))return null;
+ const iso=/^(20\d{2})-(\d{2})-(\d{2})$/.exec(row.report_date||'');
+ if(!iso)return null;
+ const compactClass=s=>guardianEvidenceNormalize(s).toLowerCase();
+ const sectionLines=lines.filter(l=>/^Ratios?\s+(?:and|&)\s+Supplemental\s+Data\b/i.test(l.text));
+ const found=[];
+ for(const section of sectionLines){
+  const cls=guardianEvidenceClassFromHeading(section.text)||null;
+  if(!cls||compactClass(cls)!==compactClass(row.class_name))continue;
+  // Match the latest date by its actual date/year header cells. Annual
+  // reports may split "December 31," and "2025" onto separate PDF.js lines.
+  const target=guardianEvidenceDateCenter(lines,section,iso);
+  if(!Number.isFinite(target))continue;
+  const metricRx=key==='MER'?/^Management\s+expense\s+ratio\b/i:/^Portfolio\s+turnover\s+(?:rate|ratio)\b/i;
+  const nextSection=sectionLines.filter(l=>l.y<section.y).sort((a,b)=>b.y-a.y)[0];
+  const lowerBound=nextSection?nextSection.y+2:section.y-285;
+  const metricLines=lines.filter(l=>l.y<section.y-2&&l.y>lowerBound&&section.y-l.y<285&&metricRx.test(l.text)
+    &&!(key==='MER'&&/\bbefore\s+waivers\b|\babsorptions\b/i.test(l.text)));
+  if(metricLines.length!==1)continue;
+  const line=metricLines[0];
+  const candidates=cells(line).filter(c=>matchesCell(c,value)&&
+    Math.abs((c.x+c.box.w/2)-target)<19);
+  if(candidates.length===1)found.push(candidates[0]);
+ }
+ const unique=new Map(found.map(c=>[`${c.box.x.toFixed(2)}:${c.box.y.toFixed(2)}`,c]));
+ if(unique.size!==1)return null;
+ const hit=[...unique.values()][0];
+ return {...hit,page:page.page,metric:key,kind:'guardian-current-period-class-and-metric-cell'};
+}
+
+const evidencePolicy_beutel_goodman={stamps:{beutelGoodmanRatioLocatorVersion:2}};
+function beutelGoodmanEvidenceNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();
+}
+function beutelGoodmanEvidenceClass(line){
+ const match=/^Class\s+([A-Z0-9][A-Z0-9-]*)\s+Units?$/i.exec(beutelGoodmanEvidenceNormalize(line));
+ return match?'Class '+match[1].toUpperCase():null;
+}
+function beutelGoodmanEvidenceDateHeader(line,iso){
+ const monthNames=['January','February','March','April','May','June','July','August','September','October','November','December'];
+ const month=monthNames[Number(iso[2])-1];if(!month||!Array.isArray(line.items))return null;
+ const rx=new RegExp('^'+month+'\\s+'+iso[1]+'$','i');
+ const dates=line.items.filter(item=>rx.test(beutelGoodmanEvidenceNormalize(item.str)));
+ const years=line.items.filter(item=>/^20\d{2}$/.test(beutelGoodmanEvidenceNormalize(item.str)));
+ if(dates.length!==1||years.length<2||Number(years[0].str)!==Number(iso[1])-1||years.slice(1).some((item,index)=>Number(item.str)>=Number(years[index].str)))return null;
+ const item=dates[0];
+ return item.x+(Number(item.w)||0)/2;
+}
+function validateDocumentEvidence_beutel_goodman(pages,row){
+ const manager=(pages||[]).slice(0,5).some(page=>/Beutel\s+Goodman\s+Managed\s+Funds/i.test(page.text||'')||/Beutel,\s*Goodman\s*&\s*Company\s+Ltd\.?/i.test(page.text||''));
+ const fund=beutelGoodmanEvidenceNormalize(row?.fund_name).toLowerCase().replace(/[^a-z0-9]/g,'');
+ return manager&&fund&&(pages||[]).some(page=>beutelGoodmanEvidenceNormalize(page.text||'').toLowerCase().replace(/[^a-z0-9]/g,'').includes(fund));
+}
+function locateCell_beutel_goodman(page,lines,row,key,value,context){
+ if((key!=='MER'&&key!=='PTR')||value===null||value===undefined||!Array.isArray(page.items)||page.ocrUsed)return null;
+ const fund=beutelGoodmanEvidenceNormalize(row?.fund_name).toLowerCase().replace(/[^a-z0-9]/g,'');
+ if(!fund||!beutelGoodmanEvidenceNormalize(page.text||'').toLowerCase().replace(/[^a-z0-9]/g,'').includes(fund))return null;
+ const iso=/^(20\d{2})-(\d{2})-(\d{2})$/.exec(row.report_date||'');if(!iso)return null;
+ const sections=lines.filter(line=>/^Ratios\s+and\s+Supplemental\s+Data$/i.test(line.text));
+ if(sections.length!==1)return null;
+ const section=sections[0];
+ const expectedClass=String(row.class_identity||row.class_name||'');
+ const classes=lines.filter(line=>line.y<section.y&&section.y-line.y<28&&
+  beutelGoodmanEvidenceClass(line.text)===expectedClass);
+ if(classes.length!==1)return null;
+ const classLine=classes[0];
+ const headers=lines.filter(line=>line.y<classLine.y&&classLine.y-line.y<48&&
+  Number.isFinite(beutelGoodmanEvidenceDateHeader(line,iso)));
+ if(headers.length!==1)return null;
+ const header=headers[0],target=beutelGoodmanEvidenceDateHeader(header,iso);
+ const labelRx=key==='MER'?/^Management\s+expense\s+ratio\b(?!\s+before\b)/i:/^Portfolio\s+turnover\s+rate\b/i;
+ const metricLines=lines.filter(line=>line.y<header.y&&header.y-line.y<115&&labelRx.test(line.text));
+ if(metricLines.length!==1)return null;
+ const candidates=cells(metricLines[0]).filter(cell=>matchesCell(cell,value)&&
+  Math.abs((cell.box.x+cell.box.w/2)-target)<18);
+ if(candidates.length!==1)return null;
+ return {...candidates[0],page:page.page,kind:'beutel-goodman-current-period-class-ratio-cell'};
+}
+
+const evidencePolicy_canada_life={stamps:{canadaLifeRatioLocatorVersion:1}};
+function canadaLifeNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00a0\u200b\u00ad]/g,' ').replace(/\s+/g,' ').trim();
+}
+function canadaLifeCompact(value){return canadaLifeNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');}
+function canadaLifeClassFromHeader(line){
+ const text=canadaLifeNormalize(line?.text||'');
+ const match=/^(Premium\s+Series|[A-Z][A-Z0-9]{0,4}\s+Series|Series\s+[A-Z][A-Z0-9]{0,3})(?=\s+20\d{2}\b)/i.exec(text);
+ return match?canadaLifeNormalize(match[1]):null;
+}
+function canadaLifeDateParts(value){
+ const match=/^\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})\s*$/i.exec(canadaLifeNormalize(value));
+ if(!match)return null;
+ const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+ return {month:months[match[1].slice(0,3).toLowerCase()],day:Number(match[2])};
+}
+function canadaLifeTokenCenter(item){return Number(item?.x)+(Number(item?.w)||0)/2;}
+function canadaLifeCurrentHeader(lines,header,yearItems,date){
+ if(!yearItems.length||Number(yearItems[0].str.trim())!==Number(String(date||'').slice(0,4)))return null;
+ const iso=/^(\d{4})-(\d{2})-(\d{2})$/.exec(date||'');if(!iso)return null;
+ const candidates=lines.filter(line=>line.y>=header.y&&line.y-header.y<=20).flatMap(line=>line.items)
+  .map(item=>({item,parts:canadaLifeDateParts(item.str)}))
+  .filter(entry=>entry.parts&&entry.parts.month===iso[2]&&entry.parts.day===Number(iso[3])
+    &&Math.abs(canadaLifeTokenCenter(entry.item)-canadaLifeTokenCenter(yearItems[0]))<22);
+ return candidates.length===1?{x:canadaLifeTokenCenter(yearItems[0]),year:Number(iso[1])}:null;
+}
+function canadaLifeEvidenceMetricCells(line){
+ const found=cells(line).map(cell=>({...cell}));
+ for(const item of line.items||[]){
+  const raw=canadaLifeNormalize(item.str);
+  if(!/^n\s*\/?\s*a$/i.test(raw)||!(Number(item.w)>0))continue;
+  found.push({value:null,isMissing:true,raw,x:item.x,
+   box:{x:Math.max(0,item.x-1),y:line.y-1,w:item.w+2,h:Math.max(6,item.h||8)+2}});
+ }
+ return found.sort((a,b)=>a.x-b.x);
+}
+function canadaLifeEvidenceCellAtColumn(line,columnX){
+ if(!line||!Number.isFinite(columnX))return null;
+ const candidates=canadaLifeEvidenceMetricCells(line).filter(cell=>{
+  const center=cell.box?cell.box.x+cell.box.w/2:Number(cell.x);
+  return Number.isFinite(center)&&Math.abs(center-columnX)<19;
+ });
+ return candidates.length===1?candidates[0]:null;
+}
+function canadaLifeEvidencePageTables(page,fund,date){
+ if(!page||!Array.isArray(page.items)||!page.items.length||page.ocrUsed)return [];
+ if(!/RATIOS\s+AND\s+SUPPLEMENTAL\s+DATA/i.test(page.text||''))return [];
+ const compactFund=canadaLifeCompact(fund);
+ if(compactFund.length<12||!canadaLifeCompact((page.text||'').slice(0,900)).includes(compactFund))return [];
+ const width=Number(page.width)||612,split=width/2,output=[];
+ for(const [minX,maxX] of [[0,split-3],[split-3,width+3]]){
+  const columnItems=page.items.filter(item=>Number.isFinite(item.x)&&item.x>=minX&&item.x<maxX);
+  const lines=textLines(columnItems);
+  const headers=lines.map(line=>{
+   const cls=canadaLifeClassFromHeader(line);
+   const years=line.items.filter(item=>/^20\d{2}$/.test(String(item.str||'').trim())).sort((a,b)=>a.x-b.x);
+   return cls&&years.length>=2?{line,cls,years}:null;
+  }).filter(Boolean).filter(header=>canadaLifeCurrentHeader(lines,header.line,header.years,date));
+  headers.sort((a,b)=>b.line.y-a.line.y);
+  for(let index=0;index<headers.length;index++){
+   const header=headers[index],next=headers[index+1];
+   const lowerY=next?next.line.y:Math.max(0,header.line.y-175);
+   const block=lines.filter(line=>line.y<header.line.y-2&&line.y>lowerY+2&&line.y>header.line.y-175);
+   const merLines=block.filter(line=>/^Management\s+expense\s+ratio\s*\(\s*%\s*\)/i.test(line.text));
+   const ptrLines=block.filter(line=>/^Portfolio\s+turnover\s+rate\s*\(\s*%\s*\)/i.test(line.text));
+   if(merLines.length!==1||ptrLines.length!==1)continue;
+   const currentX=canadaLifeTokenCenter(header.years[0]);
+   const merCell=canadaLifeEvidenceCellAtColumn(merLines[0],currentX);
+   const ptrCell=canadaLifeEvidenceCellAtColumn(ptrLines[0],currentX);
+   if(!merCell||!ptrCell)continue;
+   output.push({cls:header.cls,page:page.page,currentX,merLine:merLines[0],ptrLine:ptrLines[0],
+    values:{MER:merCell.value??null,TER:null,PTR:ptrCell.value??null}});
+  }
+ }
+ return output;
+}
+function locateCell_canada_life(page,lines,row,key,value,context){
+ if(!['MER','PTR'].includes(key)||!canadaLifeCompact(page.text||'').includes(canadaLifeCompact(row.fund_name)))return null;
+ const expected=canadaLifeNormalize(row.class_identity||row.class_name).toLowerCase();
+ const tables=canadaLifeEvidencePageTables(page,row.fund_name,row.report_date).filter(table=>table.cls.toLowerCase()===expected);
+ if(tables.length!==1)return null;
+ const table=tables[0],line=key==='MER'?table.merLine:table.ptrLine;
+ const cell=canadaLifeEvidenceCellAtColumn(line,table.currentX);
+ if(!cell||!matchesCell(cell,value))return null;
+ return {...cell,page:page.page,metric:key,kind:'canada-life-current-period-series-ratio-cell'};
+}
+
+// Keep the evidence policy adapter-local. The central viewer and shared
+// evidence engine remain FMC-independent.
+const evidencePolicy_ccl={stamps:{cclRatioLocatorVersion:1}};
+function cclEvidenceNormalize(value){return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();}
+function cclEvidenceCompact(value){return cclEvidenceNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');}
+function cclEvidenceItems(items){
+ const out=[];
+ for(const item of (items||[])){
+  if(typeof item.str!=='string'||!item.str.trim()||!Number.isFinite(item.x)||!Number.isFinite(item.y))continue;
+  const normalized=cclEvidenceNormalize(item.str).toLowerCase();
+  if(out.some(old=>cclEvidenceNormalize(old.str).toLowerCase()===normalized&&Math.abs(old.x-item.x)<1.15&&Math.abs(old.y-item.y)<2.25))continue;
+  out.push({...item,str:cclEvidenceNormalize(item.str),h:Math.max(5,Number(item.h)||8),w:Math.max(0,Number(item.w)||0)});
+ }
+ return out.sort((a,b)=>b.y-a.y||a.x-b.x);
+}
+function cclEvidenceLines(items){
+ const lines=[];
+ for(const item of cclEvidenceItems(items)){
+  let line=lines.find(row=>Math.abs(row.y-item.y)<Math.max(1.0,Math.min(1.3,item.h*.15)));
+  if(!line){line={y:item.y,items:[]};lines.push(line);}
+  line.items.push(item);
+ }
+ for(const line of lines){line.items.sort((a,b)=>a.x-b.x);line.text=line.items.map(x=>x.str).join(' ').replace(/\s+/g,' ').trim();}
+ return lines.sort((a,b)=>b.y-a.y);
+}
+function cclEvidenceSeries(line){
+ const text=cclEvidenceNormalize(line.items.filter(item=>item.x<285).map(item=>item.str).join(' '));
+ const match=/^(Series|Class)\s+(.+)$/i.exec(text);
+ if(!match||/\b(?:inception|date|units?|outstanding)\b/i.test(match[2]))return null;
+ const suffix=cclEvidenceNormalize(match[2]).replace(/\s*\(\d+\)\s*$/,'').trim();
+ return suffix&&suffix.length<=45&&!/\b20\d{2}\b/.test(suffix)?match[1][0].toUpperCase()+match[1].slice(1).toLowerCase()+' '+suffix:null;
+}
+function cclEvidenceDateLabel(value){
+ const match=/^(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2}),?$/i.exec(cclEvidenceNormalize(value));
+ if(!match)return null;
+ const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+ return {month:months[match[1].slice(0,3).toLowerCase()],day:match[2].padStart(2,'0')};
+}
+function cclEvidenceCenter(item){return item.x+(Number(item.w)||0)/2;}
+function cclEvidenceColumns(lines,heading){
+ const years=heading.items.filter(item=>item.x>285&&/^20\d{2}$/.test(item.str.trim()));
+ const dates=lines.filter(line=>line.y>heading.y+2&&line.y-heading.y<18).flatMap(line=>line.items)
+  .map(item=>({item,date:cclEvidenceDateLabel(item.str)})).filter(x=>x.date);
+ const columns=[];
+ for(const entry of dates){
+  const center=cclEvidenceCenter(entry.item);
+  const nearby=years.map(item=>({item,distance:Math.abs(cclEvidenceCenter(item)-center)})).filter(x=>x.distance<6).sort((a,b)=>a.distance-b.distance);
+  if(nearby.length!==1)continue;
+  const date=`${nearby[0].item.str.trim()}-${entry.date.month}-${entry.date.day}`;
+  if(!columns.some(x=>x.date===date))columns.push({date,center});
+ }
+ return columns;
+}
+function cclEvidenceLabel(line,key){
+ const patterns={MER:/^Management\s+expense\s+ratio(?:\s*\(\d+\))?$/i,PTR:/^Portfolio\s+turnover\s+(?:rate|ratio)(?:\s*\(\d+\))?$/i};
+ return line.items.find(item=>item.x<285&&patterns[key]?.test(cclEvidenceNormalize(item.str)));
+}
+function cclEvidenceCellTokens(item){
+ const raw=cclEvidenceNormalize(item.str).replace(/\s+/g,'');
+ if(/^[—–−-]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return [{value:null,isMissing:true,raw,item,x:item.x+(Number(item.w)||0)/2,box:{x:Math.max(0,item.x-1),y:item.y-1,w:Math.max(2,item.w)+2,h:item.h+2}}];
+ const out=[],rx=/(?:^|[^\w.])((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?%)(?=$|[^\w])/g;let m;
+ while((m=rx.exec(raw))){
+  const token=m[1],value=Number(token.replace(/[,%]/g,''));if(!Number.isFinite(value)||value<0||value>1000)continue;
+  const start=m.index+(m[0].length-token.length),width=(Number(item.w)||raw.length*item.h*.45)*token.length/Math.max(1,raw.length);
+  const x=item.x+(Number(item.w)||raw.length*item.h*.45)*start/Math.max(1,raw.length);
+  out.push({value,isMissing:false,raw:token,item,x,box:{x:Math.max(0,x-1),y:item.y-1,w:Math.max(1,width)+2,h:item.h+2}});
+ }
+ return out;
+}
+function cclEvidenceFindCell(page,row,key,value){
+ if(!Array.isArray(page.items)||!page.items.length||page.ocrUsed)return null;
+ const lines=cclEvidenceLines(page.items);
+ const sections=lines.filter(line=>/^Ratios\s*(?:&|and)\s*Supplemental\s+Data\s*:?$/i.test(line.text));
+ if(sections.length!==1)return null;
+ const section=sections[0],rawHeadings=lines.filter(line=>line.y<section.y&&section.y-line.y<520&&cclEvidenceSeries(line))
+  .map(line=>({line,cls:cclEvidenceSeries(line),columns:cclEvidenceColumns(lines,line)}));
+ const headings=rawHeadings.filter(item=>item.columns.some(column=>column.date===row.report_date)).sort((a,b)=>b.line.y-a.line.y);
+ const expected=cclEvidenceNormalize(row.class_identity||row.class_name).toLowerCase();
+ const matching=headings.filter(item=>cclEvidenceNormalize(item.cls).toLowerCase()===expected);
+ if(matching.length!==1)return null;
+ const current=matching[0],index=headings.indexOf(current),next=headings[index+1];
+ const block=lines.filter(line=>line.y<current.line.y-2&&(!next||line.y>next.line.y+2));
+ const columns=cclEvidenceColumns(lines,current.line),target=columns.find(column=>column.date===row.report_date);
+ if(!target)return null;
+ let selected=null;
+ for(const candidate of block){const label=cclEvidenceLabel(candidate,key);if(label){selected={line:candidate,label};break;}}
+ if(!selected)return null;
+ const {line,label}=selected;
+ const cells=line.items.filter(item=>item.x>label.x+label.w+5).flatMap(cclEvidenceCellTokens)
+  .filter(cell=>Math.abs((cell.x??cell.item.x+(cell.item.w||0)/2)-target.center)<24&&
+    (value===null||value===undefined?cell.isMissing:!cell.isMissing&&Math.abs(cell.value-Number(value))<.000001));
+ if(cells.length!==1)return null;
+ return {box:cells[0].box,page:page.page,metric:key,kind:'ccl-current-period-series-ratio-cell',raw:cells[0].raw,isMissing:!!cells[0].isMissing};
+}
+function validateDocumentEvidence_ccl(pages,row){
+ const branded=(pages||[]).slice(0,3).some(page=>/www\.cclfundsinc\.com/i.test(page.text||'')&&/CC&L/i.test(page.text||''));
+ const fund=cclEvidenceCompact(row?.fund_name);
+ return branded&&fund.length>12&&(pages||[]).some(page=>cclEvidenceCompact(page.text||'').includes(fund));
+}
+function locateCell_ccl(page,lines,row,key,value,context){
+ if(!['MER','PTR'].includes(key))return null;
+ return cclEvidenceFindCell(page,row,key,value);
+}
+
+const evidencePolicy_sei={stamps:{seiFinancialHighlightsLocatorVersion:1}};
+function seiEvidenceNormalize(value){return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();}
+function seiEvidenceItems(items){
+ const out=[];
+ for(const item of items||[]){
+  if(typeof item.str!=='string'||!item.str.trim()||!Number.isFinite(item.x)||!Number.isFinite(item.y))continue;
+  const normalized=seiEvidenceNormalize(item.str).toLowerCase();
+  if(out.some(old=>seiEvidenceNormalize(old.str).toLowerCase()===normalized&&Math.abs(old.x-item.x)<1.15&&Math.abs(old.y-item.y)<2.25))continue;
+  out.push({...item,str:seiEvidenceNormalize(item.str),h:Math.max(5,Number(item.h)||8),w:Math.max(0,Number(item.w)||0)});
+ }
+ return out.sort((a,b)=>b.y-a.y||a.x-b.x);
+}
+function seiEvidenceLines(items){
+ const lines=[];
+ for(const item of seiEvidenceItems(items)){
+  let line=lines.find(row=>Math.abs(row.y-item.y)<Math.max(1.0,Math.min(1.5,item.h*.18)));
+  if(!line){line={y:item.y,items:[]};lines.push(line);}
+  line.items.push(item);
+ }
+ for(const line of lines){line.items.sort((a,b)=>a.x-b.x);line.text=line.items.map(item=>item.str).join(' ').replace(/\s+/g,' ').trim();}
+ return lines.sort((a,b)=>b.y-a.y);
+}
+function seiEvidenceClass(line){
+ const left=seiEvidenceNormalize((line.items||[]).filter(item=>item.x<190).map(item=>item.str).join(' '));
+ const match=/^Class\s+([A-Za-z0-9][A-Za-z0-9 &/().-]{0,35}?)\s*\**$/i.exec(left);
+ if(!match)return null;
+ const suffix=seiEvidenceNormalize(match[1]).replace(/\s+Units?$/i,'').trim();
+ return suffix&&suffix.length<=35&&!/\b(?:inception|date|outstanding|units?)\b/i.test(suffix)?'Class '+suffix:null;
+}
+function seiEvidenceYears(line){return (line.items||[]).filter(item=>item.x>200&&/^20\d{2}$/.test(seiEvidenceNormalize(item.str)));}
+function seiEvidenceRatioHeading(line){return /^RATIOS\s+AND\s+SUPPLEMENTAL\s+DATA\s*:?$/i.test(seiEvidenceNormalize(line.text));}
+function seiEvidenceBlocks(lines,reportYear){
+ const headings=lines.map(line=>({line,cls:seiEvidenceClass(line)})).filter(item=>item.cls&&item.line.items.some(it=>it.x<150));
+ const blocks=[];
+ for(let i=0;i<headings.length;i++){
+  const current=headings[i],next=headings[i+1],lower=next?.line.y??20;
+  const header=lines.filter(line=>line.y<current.line.y&&line.y>lower&&current.line.y-line.y<45&&seiEvidenceYears(line).length>=2).sort((a,b)=>b.y-a.y)[0];
+  if(!header)continue;
+  const yearHits=seiEvidenceYears(header).filter(item=>Number(seiEvidenceNormalize(item.str))===reportYear);
+  if(yearHits.length!==1)continue;
+  const yearItem=yearHits[0],center=yearItem.x+(Number(yearItem.w)||0)/2;
+  const section=lines.filter(line=>line.y<header.y&&line.y>lower&&seiEvidenceRatioHeading(line)).sort((a,b)=>b.y-a.y)[0];
+  if(!section)continue;
+  blocks.push({cls:current.cls,next:next?.line||null,lower,center,section,metricLines:lines.filter(line=>line.y<section.y&&line.y>lower)});
+ }
+ return blocks;
+}
+function seiEvidenceLabel(line,key){
+ const patterns={MER:/^Management\s+expense\s+ratio(?:\s*\([a-z0-9]{1,3}\))?$/i,PTR:/^Portfolio\s+turnover\s+(?:rate|ratio)(?:\s*\([a-z0-9]{1,3}\))?$/i};
+ return (line.items||[]).find(item=>item.x<250&&patterns[key]?.test(seiEvidenceNormalize(item.str)));
+}
+function seiEvidenceTokens(item){
+ const raw=seiEvidenceNormalize(item.str).replace(/\s+/g,'');
+ if(/^[—–−-]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return [{value:null,isMissing:true,raw:raw||item.str,item,x:item.x+(Number(item.w)||0)/2,box:{x:Math.max(0,item.x-1),y:item.y-1,w:Math.max(2,item.w)+2,h:item.h+2}}];
+ const out=[],rx=/(?:^|[^\w.])((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?%?)(?=$|[^\w])/g;let match;
+ while((match=rx.exec(raw))){
+  const token=match[1],n=Number(token.replace(/[,%]/g,''));if(!Number.isFinite(n)||n<0||n>1000)continue;
+  const start=match.index+(match[0].length-token.length),width=(Number(item.w)||raw.length*item.h*.45)*token.length/Math.max(1,raw.length);
+  const x=item.x+(Number(item.w)||raw.length*item.h*.45)*start/Math.max(1,raw.length);
+  out.push({value:n,isMissing:false,raw:token,item,x:x+width/2,box:{x:Math.max(0,x-1),y:item.y-1,w:Math.max(1,width)+2,h:item.h+2}});
+ }
+ return out;
+}
+function seiEvidenceFindCell(page,row,key,value){
+ if(!Array.isArray(page.items)||!page.items.length||page.ocrUsed||!['MER','PTR'].includes(key))return null;
+ const reportYear=Number(String(row.report_date||'').slice(0,4));if(!reportYear)return null;
+ const lines=seiEvidenceLines(page.items),blocks=seiEvidenceBlocks(lines,reportYear);
+ const expected=seiEvidenceNormalize(row.class_identity||row.class_name).toLowerCase();
+ const matching=blocks.filter(block=>seiEvidenceNormalize(block.cls).toLowerCase()===expected);
+ if(matching.length!==1)return null;
+ const block=matching[0];let selected=null;
+ for(const line of block.metricLines){const label=seiEvidenceLabel(line,key);if(label){selected={line,label};break;}}
+ if(!selected)return null;
+ const hits=selected.line.items.filter(item=>item.x>selected.label.x+selected.label.w+5).flatMap(seiEvidenceTokens)
+  .filter(cell=>Math.abs(cell.x-block.center)<16&&(value===null||value===undefined?cell.isMissing:!cell.isMissing&&Math.abs(cell.value-Number(value))<0.000001));
+ if(hits.length!==1)return null;
+ return {box:hits[0].box,page:page.page,metric:key,kind:'sei-latest-reporting-year-class-ratio-cell',raw:hits[0].raw,isMissing:!!hits[0].isMissing};
+}
+function validateDocumentEvidence_sei(pages,row){
+ const head=(pages||[]).slice(0,3).map(page=>page.text||'').join('\n');
+ const fund=seiEvidenceNormalize(row?.fund_name).toLowerCase();
+ return /SEI Investments Canada Company/i.test(head)&&/seic\.com\/en-ca/i.test(head)&&fund.length>7&&seiEvidenceNormalize(head).toLowerCase().includes(fund);
+}
+function locateCell_sei(page,lines,row,key,value,context){
+ if(!['MER','PTR'].includes(key))return null;
+ return seiEvidenceFindCell(page,row,key,value);
+}
+
+const FMC_EVIDENCE_HANDLERS={"nbi":locateCell_nbi,"desjardins":locateCell_desjardins,"franklin":locateCell_franklin,"manulife":locateCell_manulife,"dynamic":locateCell_dynamic,"purpose":locateCell_purpose,"blackrock":locateCell_blackrock,"rbc":locateCell_rbc,"bmo":locateCell_bmo,"bmg":locateCell_bmg,"td":locateCell_td,"lysander":locateCell_lysander,"nei":locateCell_nei,"mackenzie":locateCell_mackenzie,"ig_mackenzie":locateCell_ig_mackenzie,"fidelity":locateCell_fidelity,"pender":locateCell_pender,"brandes":locateCell_brandes,"agf":locateCell_agf,"vanguard":locateCell_vanguard,"hamilton":locateCell_hamilton,"newgen":locateCell_newgen,"rpia":locateCell_rpia,"leith_wheeler":locateCell_leith_wheeler,"ci":locateCell_ci,"scotia":locateCell_scotia,"capital_group":locateCell_capital_group,"arrow_capital":locateCell_arrow_capital,"guardian":locateCell_guardian,"beutel_goodman":locateCell_beutel_goodman,"canada_life":locateCell_canada_life,"ccl":locateCell_ccl,"sei":locateCell_sei};
 const FMC_GAP_HANDLERS={"sun_life":locateGap_sun_life,"middlefield":locateGap_middlefield,"rbc":locateGap_rbc,"first_trust":locateGap_first_trust,"harvest":locateGap_harvest,"ninepoint":locateGap_ninepoint,"global_x":locateGap_global_x,"ci":locateGap_ci};
-const FMC_EVIDENCE_POLICIES={"nbi":evidencePolicy_nbi,"desjardins":evidencePolicy_desjardins,"sun_life":evidencePolicy_sun_life,"franklin":evidencePolicy_franklin,"middlefield":evidencePolicy_middlefield,"manulife":evidencePolicy_manulife,"dynamic":evidencePolicy_dynamic,"purpose":evidencePolicy_purpose,"blackrock":evidencePolicy_blackrock,"rbc":evidencePolicy_rbc,"bmo":evidencePolicy_bmo,"bmg":evidencePolicy_bmg,"first_trust":evidencePolicy_first_trust,"td":evidencePolicy_td,"lysander":evidencePolicy_lysander,"nei":evidencePolicy_nei,"mackenzie":evidencePolicy_mackenzie,"ig_mackenzie":evidencePolicy_ig_mackenzie,"fidelity":evidencePolicy_fidelity,"pender":evidencePolicy_pender,"brandes":evidencePolicy_brandes,"agf":evidencePolicy_agf,"harvest":evidencePolicy_harvest,"vanguard":evidencePolicy_vanguard,"ninepoint":evidencePolicy_ninepoint,"global_x":evidencePolicy_global_x,"hamilton":evidencePolicy_hamilton,"newgen":evidencePolicy_newgen,"leith_wheeler":evidencePolicy_leith_wheeler,"ci":evidencePolicy_ci,"scotia":evidencePolicy_scotia};
-const FMC_DOCUMENT_IDENTITIES={"bmg":validateDocumentEvidence_bmg};
+const FMC_EVIDENCE_POLICIES={"nbi":evidencePolicy_nbi,"desjardins":evidencePolicy_desjardins,"sun_life":evidencePolicy_sun_life,"franklin":evidencePolicy_franklin,"middlefield":evidencePolicy_middlefield,"manulife":evidencePolicy_manulife,"dynamic":evidencePolicy_dynamic,"purpose":evidencePolicy_purpose,"blackrock":evidencePolicy_blackrock,"rbc":evidencePolicy_rbc,"bmo":evidencePolicy_bmo,"bmg":evidencePolicy_bmg,"first_trust":evidencePolicy_first_trust,"td":evidencePolicy_td,"lysander":evidencePolicy_lysander,"nei":evidencePolicy_nei,"mackenzie":evidencePolicy_mackenzie,"ig_mackenzie":evidencePolicy_ig_mackenzie,"fidelity":evidencePolicy_fidelity,"pender":evidencePolicy_pender,"brandes":evidencePolicy_brandes,"agf":evidencePolicy_agf,"harvest":evidencePolicy_harvest,"vanguard":evidencePolicy_vanguard,"ninepoint":evidencePolicy_ninepoint,"global_x":evidencePolicy_global_x,"hamilton":evidencePolicy_hamilton,"newgen":evidencePolicy_newgen,"leith_wheeler":evidencePolicy_leith_wheeler,"ci":evidencePolicy_ci,"scotia":evidencePolicy_scotia,"capital_group":evidencePolicy_capital_group,"arrow_capital":evidencePolicy_arrow_capital,"guardian":evidencePolicy_guardian,"beutel_goodman":evidencePolicy_beutel_goodman,"canada_life":evidencePolicy_canada_life,"ccl":evidencePolicy_ccl,"sei":evidencePolicy_sei};
+const FMC_DOCUMENT_IDENTITIES={"bmg":validateDocumentEvidence_bmg,"capital_group":validateDocumentEvidence_capital_group,"arrow_capital":validateDocumentEvidence_arrow_capital,"guardian":validateDocumentEvidence_guardian,"beutel_goodman":validateDocumentEvidence_beutel_goodman,"ccl":validateDocumentEvidence_ccl,"sei":validateDocumentEvidence_sei};
 const FMC_EVIDENCE_LAYOUTS={"middlefield":evidenceLayout_middlefield,"manulife":evidenceLayout_manulife,"purpose":evidenceLayout_purpose,"first_trust":evidenceLayout_first_trust,"td":evidenceLayout_td,"agf":evidenceLayout_agf,"newgen":evidenceLayout_newgen,"leith_wheeler":evidenceLayout_leith_wheeler};
 const FMC_ANNUAL_ETF_VALIDATORS={"vanguard":validateAnnualEtfRow_vanguard,"hamilton":validateAnnualEtfRow_hamilton};
 const FMC_RATIO_HEADER_HANDLERS={"rbc":ratioHeader_rbc,"ci":ratioHeader_ci};
@@ -1715,6 +2325,13 @@ function locateInPage(page,row,key,value,{hint=false,preparedLines=null}={}){
  const fundTitle=clean(row.fund_name),headerText=clean((page.text||'').slice(0,1300));
  const namedEtf=/^(?:ETF|CAD|USD)\s+Units$/i.test(row.class_name||'')&&fundTitle.length>13&&headerText.includes(fundTitle);
  if(!year||!pageContext(page,lines))return null;
+ if(key==='TER'){
+  // Do not let older FMC locators return Trading Expense Ratio cells.
+  if(row.evidence?.TER?.totalExpenseValidated!==true)return null;
+  const source=totalExpenseRatioSource([page],row);
+  if(!source||!matchesCell({value:source.value,isMissing:source.isMissing},value))return null;
+  return {...source,metric:'TER'};
+ }
  const matches=[];
  function choose(candidates,kind){
   const unique=new Map(candidates.map(m=>[`${m.box.x.toFixed(1)}:${m.box.y.toFixed(1)}`,{...m,page:page.page,metric:key,kind}]));
@@ -1786,6 +2403,7 @@ function locateInPage(page,row,key,value,{hint=false,preparedLines=null}={}){
 // Match the original metric label, source reporting-year column, and physical
 // series block. Never choose another column merely because its value matches.
 function locateLastGap(page,row,key,value,pages,preparedLines=null){
+ if(key==='TER')return null; // Legacy gap locators map Trading, not Total Expense Ratio.
  if(!gapDocIdentity(pages,row))return null;
  if(!FMC_GAP_HANDLERS[row.fmc_key]||!Array.isArray(page.items)||page.ocrUsed)return null;
  const lines=preparedLines||textLines(page.items);
@@ -1827,6 +2445,7 @@ function locate(pages,rows){
   const key=row.row_id||row.class_name;
   const record={...emptyRecord(row),pages:sourcePages(row)};
   for(const metric of METRICS){
+   if(metric==='TER'&&row.evidence?.TER?.totalExpenseValidated!==true){record.originalValues.TER=null;continue;}
    const value=Object.hasOwn(row.originalValues||{},metric)?row.originalValues[metric]:row[metric];
    record.originalValues[metric]=value??null;
    if(row.evidence?.[metric]?.method==='manual'&&!Object.hasOwn(row.originalValues||{},metric))continue;
