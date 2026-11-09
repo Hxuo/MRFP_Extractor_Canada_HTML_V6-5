@@ -5,6 +5,13 @@ function locateInPage(page,row,key,value,{hint=false,preparedLines=null}={}){
  const fundTitle=clean(row.fund_name),headerText=clean((page.text||'').slice(0,1300));
  const namedEtf=/^(?:ETF|CAD|USD)\s+Units$/i.test(row.class_name||'')&&fundTitle.length>13&&headerText.includes(fundTitle);
  if(!year||!pageContext(page,lines))return null;
+ if(key==='TER'){
+  // Do not let older FMC locators return Trading Expense Ratio cells.
+  if(row.evidence?.TER?.totalExpenseValidated!==true)return null;
+  const source=totalExpenseRatioSource([page],row);
+  if(!source||!matchesCell({value:source.value,isMissing:source.isMissing},value))return null;
+  return {...source,metric:'TER'};
+ }
  const matches=[];
  function choose(candidates,kind){
   const unique=new Map(candidates.map(m=>[`${m.box.x.toFixed(1)}:${m.box.y.toFixed(1)}`,{...m,page:page.page,metric:key,kind}]));
@@ -76,6 +83,7 @@ function locateInPage(page,row,key,value,{hint=false,preparedLines=null}={}){
 // Match the original metric label, source reporting-year column, and physical
 // series block. Never choose another column merely because its value matches.
 function locateLastGap(page,row,key,value,pages,preparedLines=null){
+ if(key==='TER')return null; // Legacy gap locators map Trading, not Total Expense Ratio.
  if(!gapDocIdentity(pages,row))return null;
  if(!FMC_GAP_HANDLERS[row.fmc_key]||!Array.isArray(page.items)||page.ocrUsed)return null;
  const lines=preparedLines||textLines(page.items);
@@ -117,6 +125,7 @@ function locate(pages,rows){
   const key=row.row_id||row.class_name;
   const record={...emptyRecord(row),pages:sourcePages(row)};
   for(const metric of METRICS){
+   if(metric==='TER'&&row.evidence?.TER?.totalExpenseValidated!==true){record.originalValues.TER=null;continue;}
    const value=Object.hasOwn(row.originalValues||{},metric)?row.originalValues[metric]:row[metric];
    record.originalValues[metric]=value??null;
    if(row.evidence?.[metric]?.method==='manual'&&!Object.hasOwn(row.originalValues||{},metric))continue;
