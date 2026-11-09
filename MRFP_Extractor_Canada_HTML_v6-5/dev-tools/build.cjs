@@ -27,7 +27,7 @@ const classBindings=manifest.filter(x=>fmc.find(f=>f.entry.key===x.key).txt.incl
   .map(x=>`[${x.profile}.style,classHeading_${x.key}]`).join(',');
 const registered=`\nconst FMC_ADAPTERS=[\n${bindings}\n];\nconst FMC_ADAPTERS_BY_KEY=Object.fromEntries(FMC_ADAPTERS.map(x=>[x.key,x]));\nconst FMC_CLASS_HEADING_BY_STYLE=Object.fromEntries([${classBindings}]);\nconst REGISTRY=FMC_ADAPTERS.map(x=>x.profile);\n`;
 const prefix='/* GENERATED from js/core + js/fmc via dev-tools/build.cjs. DO NOT EDIT DIRECTLY. Browser file:// safe. */\n(function(global){\n\'use strict\';\n';
-const engine=prefix+read('js/core/shared-utils.js')+ '\n'+profiles.join('\n')+'\n'+extract.join('\n')+'\n'+registered+read('js/core/fmc-registry.js')+read('js/core/extraction-engine.js')+'\nglobal.MRFP_ENGINE={analyzePages,detectFmc,reportDate,REGISTRY,groupLines:undefined};\n})(globalThis);\n';
+const engine=prefix+read('js/core/shared-utils.js')+'\n'+read('js/core/total-expense-ratio.js')+ '\n'+profiles.join('\n')+'\n'+extract.join('\n')+'\n'+registered+read('js/core/fmc-registry.js')+read('js/core/extraction-engine.js')+'\nglobal.MRFP_ENGINE={analyzePages,detectFmc,reportDate,REGISTRY,groupLines:undefined};\n})(globalThis);\n';
 const fmcPrimary=fmc.filter(({entry,txt})=>txt.includes('function locateCell_'+entry.key+'(')).map(({entry})=>JSON.stringify(entry.key)+':locateCell_'+entry.key).join(',');
 const fmcGap=fmc.filter(({entry,txt})=>txt.includes('function locateGap_'+entry.key+'(')).map(({entry})=>JSON.stringify(entry.key)+':locateGap_'+entry.key).join(',');
 // Evidence freshness policies live beside each adapter's evidence strategies.
@@ -41,7 +41,7 @@ const annualValidators=fmc.filter(({entry,txt})=>txt.includes('function validate
   .map(({entry})=>JSON.stringify(entry.key)+':validateAnnualEtfRow_'+entry.key).join(',');
 const ratioHeaderHandlers=fmc.filter(({entry,txt})=>txt.includes('function ratioHeader_'+entry.key+'('))
   .map(({entry})=>JSON.stringify(entry.key)+':ratioHeader_'+entry.key).join(',');
-const locator=prefix+read('js/core/evidence-utils.js')+'\n'+evidence.join('\n')
+const locator=prefix+read('js/core/evidence-utils.js')+'\n'+read('js/core/total-expense-ratio.js')+'\n'+evidence.join('\n')
  +'\nconst FMC_EVIDENCE_HANDLERS={'+fmcPrimary+'};\nconst FMC_GAP_HANDLERS={'+fmcGap+'};'
  +'\nconst FMC_EVIDENCE_POLICIES={'+evidencePolicies+'};\nconst FMC_DOCUMENT_IDENTITIES={'+documentChecks+'};\nconst FMC_EVIDENCE_LAYOUTS={'+evidenceLayouts+'};\nconst FMC_ANNUAL_ETF_VALIDATORS={'+annualValidators+'};\nconst FMC_RATIO_HEADER_HANDLERS={'+ratioHeaderHandlers+'};\nconst GAP_FMCS=new Set(Object.keys(FMC_GAP_HANDLERS));\n'+read('js/core/evidence-engine.js')
  +'\nglobal.MRFP_EVIDENCE={GAP_FMCS:[...GAP_FMCS],LOCATOR_VERSION,needsRefresh,emptyRecord,locateLastGap,locate,locateInPage,textLines,numbers,missingMarks,cells,sourcePages,initialPage};\n})(globalThis);\n';
