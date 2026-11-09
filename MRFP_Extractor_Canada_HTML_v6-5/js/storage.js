@@ -3,6 +3,45 @@
 'use strict';
 const DBNAME='mrfp_extractor_canada_browser_v1',DBVERSION=1;
 let connection=null, unavailable=false;const volatileDocs=new Map(),volatileMeta=new Map();
+const TER_DEFINITION='total-expense-ratio-v1';
+// Old History used TER to mean Trading Expense Ratio. Preserve legacy values
+// separately for audit, but NEVER display/export them under the new TER label.
+// Read-only lazy migration also handles restored v6-5 backups and cached PDFs.
+function normalizeTERDefinition(doc){
+ if(!doc||doc.terDefinition===TER_DEFINITION)return doc;
+ const safe={...doc,terDefinition:TER_DEFINITION};
+ let hadTradingTER=false;
+ safe.results=(doc.results||[]).map(original=>{
+  const row={...original,evidence:{...(original.evidence||{})}};
+  const oldValue=row.TER;
+  if(oldValue!==null&&oldValue!==undefined&&oldValue!==''){
+   row.legacyTradingTER=oldValue;hadTradingTER=true;
+  }
+  row.TER=null;
+  delete row.evidence.TER;
+  if(row.originalValues)row.originalValues={...row.originalValues,TER:null};
+  if(row.manualCorrections?.TER)row.manualCorrections={...row.manualCorrections,TER:false};
+  return row;
+ });
+ if(doc.evidenceMap?.rows){
+  const e={...doc.evidenceMap,rows:{}};
+  for(const [key,r] of Object.entries(doc.evidenceMap.rows)){
+   const metrics={...(r.metrics||{})};delete metrics.TER;
+   const originalValues={...(r.originalValues||{}),TER:null};
+   const pages=[...new Set(Object.values(metrics).map(x=>x?.page).filter(Number.isInteger))].sort((a,b)=>a-b);
+   e.rows[key]={...r,metrics,originalValues,pages};
+  }
+  safe.evidenceMap=e;
+ }
+ if(hadTradingTER){
+  safe.verified=false;
+  safe.terRequiresRescan=true;
+  safe.notes=[...new Set([...(doc.notes||[]),
+   'Legacy TER values were Trading Expense Ratios. TER is now blank until a Total Expense Ratio is verified by re-scanning the original PDF.'])];
+ }
+ return safe;
+}
+
 function req(r){return new Promise((res,rej)=>{r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error||Error('IndexedDB request failed'));});}
 async function db(){
  if(connection)return connection;
@@ -32,15 +71,16 @@ async function transaction(store,mode,action){
   tx.onabort=()=>reject(tx.error||Error('Database transaction aborted'));
  });
 }
-async function get(hash){return await transaction('docs','readonly',s=>s.get(hash))||null;}
-async function put(doc){doc.updated=Date.now();await transaction('docs','readwrite',s=>s.put(doc));return doc;}
-async function importDoc(doc){await transaction('docs','readwrite',s=>s.put(doc));return doc;}
+async function get(hash){return normalizeTERDefinition(await transaction('docs','readonly',s=>s.get(hash))||null);}
+async function put(doc){doc=normalizeTERDefinition(doc);doc.updated=Date.now();await transaction('docs','readwrite',s=>s.put(doc));return doc;}
+async function importDoc(doc){doc=normalizeTERDefinition(doc);await transaction('docs','readwrite',s=>s.put(doc));return doc;}
 async function remove(hash){await transaction('docs','readwrite',s=>s.delete(hash));const ws=await workspace();if(ws.includes(hash))await saveWorkspace(ws.filter(h=>h!==hash));}
-async function all(){const docs=await transaction('docs','readonly',s=>s.getAll())||[];return docs.sort((a,b)=>b.updated-a.updated);}
+async function all(){const docs=await transaction('docs','readonly',s=>s.getAll())||[];return docs.map(normalizeTERDefinition).sort((a,b)=>b.updated-a.updated);}
 async function workspace(){const m=await transaction('meta','readonly',s=>s.get('workspace'));return m?.hashes||[];}
 async function saveWorkspace(hashes){await transaction('meta','readwrite',s=>s.put({key:'workspace',hashes}));}
 async function addToWorkspace(hash){const ws=await workspace();await saveWorkspace([hash,...ws.filter(x=>x!==hash)]);}
 async function clearWorkspace(){await saveWorkspace([]);}
+async function removeFromWorkspace(hash){const hashes=await workspace();if(!hashes.includes(hash))return false;await saveWorkspace(hashes.filter(item=>item!==hash));return true;}
 async function listed(){const hashes=await workspace(),docs=await all(),map=new Map(docs.map(x=>[x.hash,x]));return hashes.map(x=>map.get(x)).filter(Boolean);}
 async function fingerprint(file){
  const bytes=new Uint8Array(await file.arrayBuffer());
@@ -88,5 +128,5 @@ async function resetAllSavedData(){
  });
 }
 function slim(doc){const {blob,...rest}=doc;return rest;}
-global.MRFP_STORAGE={db,get,put,importDoc,remove,all,workspace,addToWorkspace,clearWorkspace,listed,fingerprint,slim,clearStoredPDFs,resetAllSavedData,isTemporary:()=>unavailable};
+global.MRFP_STORAGE={db,get,put,importDoc,remove,all,workspace,addToWorkspace,clearWorkspace,removeFromWorkspace,listed,fingerprint,slim,clearStoredPDFs,resetAllSavedData,isTemporary:()=>unavailable};
 })(globalThis);
