@@ -97,11 +97,15 @@ function identifyFund(pages,p){
  return issuerTitleCandidate(pages,p)?.text||'Unknown Fund';
 }
 
-function makeRow(cls,p,fund,date,vals,ev,needsReview=false){
+function makeRow(cls,p,fund,date,vals,ev,needsReview=false,metadata=null){
  const year=date?Number(date.slice(0,4)):null;
  const fid=createHash('sha256').update(p.key+'\0'+fund.toLowerCase()).digest('hex').slice(0,20);
+ // Stable row identity is based on the canonical class, never a display note
+ // such as a historical re-designation appended by an issuer adapter.
  const cid=createHash('sha256').update(fid+'\0'+cls.toLowerCase()).digest('hex').slice(0,20);
- return {class_name:cls,fund_name:fund,fmc:p.label,fmc_key:p.key,fund_id:fid,class_id:cid,row_id:cid+':'+(date||year||'unknown'),report_date:date,year,MER:vals.MER??null,TER:vals.TER??null,PTR:vals.PTR??null,evidence:ev,needs_review:needsReview||!date};
+ const displayClass=metadata?.displayClassName||cls;
+ const aliases=Array.isArray(metadata?.classAliases)?[...new Set(metadata.classAliases.map(x=>String(x||'').trim()).filter(Boolean))]:[];
+ return {class_name:displayClass,...(metadata?.displayClassName?{class_identity:cls}:{}),...(aliases.length?{class_aliases:aliases}:{}),fund_name:fund,fmc:p.label,fmc_key:p.key,fund_id:fid,class_id:cid,row_id:cid+':'+(date||year||'unknown'),report_date:date,year,MER:vals.MER??null,TER:vals.TER??null,PTR:vals.PTR??null,evidence:ev,needs_review:needsReview||!date};
 }
 function findMetric(block,metric){
  const lines=block.split(/\r?\n/);
@@ -293,6 +297,107 @@ function ratioHeadingAudit(pages,p,parsed){
  for(const pg of pages)adapter.auditRatioHeadings(pg.text,potential);
  const missing=[...potential].filter(x=>!actual.has(x.toLowerCase()));
  return potential.size?{seen:potential.size,extracted:parsed.length,possibleMissing:missing}:null;
+}
+
+/* Office TER contract (v6-5): TER = explicitly published TOTAL EXPENSE RATIO.
+ * Trading Expense Ratio and FER are never interchangeable with this metric.
+ * Strict generic evidence-backed support for single-period/column financial tables.
+ * Unrecognized layouts fail closed; issuers can add verified layout support later.
+ * This is included in BOTH generated bundles to avoid extraction/locator drift. */
+const TOTAL_EXPENSE_RATIO_DEFINITION='total-expense-ratio-v1';
+const TOTAL_EXPENSE_RATIO_LABEL=/^total\s+expense\s+ratios?\b/i;
+const TOTAL_EXPENSE_LINES_CACHE=new WeakMap();
+
+function totalExpenseNormalize(s){return String(s||'').normalize('NFKC').replace(/\s+/g,' ').trim();}
+function totalExpenseClassHeading(s){
+ const t=totalExpenseNormalize(s).replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]/g,'').replace(/(?:\s*\(\d+\))+\s*$/,'').trim();
+ const m=/^(?:(?:Series|Class)\s+[A-Z][A-Z0-9-]*|[A-Z][A-Z0-9-]*\s+(?:Shares?|Units?)|(?:ETF|CAD|USD)\s+(?:Series|Units?))\b/i.exec(t);
+ if(!m)return null;
+ const rest=t.slice(m[0].length).trim();
+ return !rest||/^(?:\*+|\(\d+\)|\(\d+\)\s*\(\d+\))$/.test(rest)?m[0].toLowerCase().replace(/\s+/g,' '):null;
+}
+function totalExpensePageLines(items){
+ const result=[];
+ for(const it of items||[]){
+  if(typeof it.str!=='string'||!it.str.trim()||!Number.isFinite(it.x)||!Number.isFinite(it.y))continue;
+  const h=Math.max(5,Number(it.h)||8);
+  let line=result.find(l=>Math.abs(l.y-it.y)<Math.max(1.5,Math.min(2.8,h*.25)));
+  if(!line){line={y:it.y,items:[]};result.push(line);}
+  line.items.push(it);
+ }
+ for(const l of result){l.items.sort((a,b)=>a.x-b.x);l.text=totalExpenseNormalize(l.items.map(it=>it.str).join(' '));}
+ return result.sort((a,b)=>b.y-a.y);
+}
+function totalExpenseCell(item){
+ const raw=String(item.str||'').trim().replace(/\s+/g,'');
+ if(/^[-–—−]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return {value:null,isMissing:true,raw};
+ if(!/^(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)\s*%?$/.test(raw))return null;
+ const n=Number(raw.replace(/[,%]/g,''));
+ return Number.isFinite(n)&&n>=0&&n<=100?{value:n,isMissing:false,raw}:null;
+}
+function totalExpenseClassMatches(found,expected){
+ const normalize=s=>totalExpenseNormalize(s).toLowerCase().replace(/\s+/g,' ');
+ return normalize(found)===normalize(expected);
+}
+function totalExpenseRatioSource(pages,row){
+ const year=Number(String(row?.report_date||'').slice(0,4))||Number(row?.year);
+ const className=row?.class_identity||row?.class_name;
+ if(!year||year<2000||year>2100||!className)return null;
+ const hits=[];
+ for(const page of pages||[]){
+  if(page?.ocrUsed||!Array.isArray(page?.items)||!page.items.length)continue;
+  // Most MRFPs do not publish this metric. Avoid building text geometry
+  // repeatedly for every class when the explicit label is not present.
+  if(page.text&&!/\btotal\s+expense\s+ratios?\b/i.test(page.text))continue;
+  let lines=TOTAL_EXPENSE_LINES_CACHE.get(page);
+  if(!lines){lines=totalExpensePageLines(page.items);TOTAL_EXPENSE_LINES_CACHE.set(page,lines);}
+  for(let ix=0;ix<lines.length;ix++){
+   const metric=lines[ix];
+   if(!TOTAL_EXPENSE_RATIO_LABEL.test(metric.text))continue;
+   // This must be a named financial-table row, not an explanatory paragraph,
+   // a calculated FER, or a before-waivers Total Expense Ratio variant.
+   const label=TOTAL_EXPENSE_RATIO_LABEL.exec(metric.text)[0];
+   const tail=metric.text.slice(label.length).trim();
+   if(/^(?:before|excluding|including|plus|less|and)\b/i.test(tail))continue;
+   // Require a physically distinct percentage cell, never a number guessed
+   // from a text run containing the entire heading and surrounding prose.
+   let accumulated='',labelRight=null;
+   for(const it of metric.items){
+    accumulated=totalExpenseNormalize(accumulated+' '+it.str);
+    if(!TOTAL_EXPENSE_RATIO_LABEL.test(accumulated))continue;
+    labelRight=it.x+(Number(it.w)||0);
+    break;
+   }
+   if(!Number.isFinite(labelRight))continue;
+   const explicitCells=metric.items.filter(it=>it.x>labelRight+2.5).map(it=>{
+    const parsed=totalExpenseCell(it);
+    if(!parsed||!Number.isFinite(it.w)||it.w<=0)return null;
+    return {...parsed,x:it.x,y:it.y,box:{x:Math.max(0,it.x-1),y:it.y-1,w:it.w+2,h:Math.max(6,it.h||8)+2}};
+   }).filter(Boolean);
+   if(!explicitCells.length)continue;
+   // Determine the NEAREST preceding class or series heading. A different
+   // class heading blocks using an identical number from the wrong class.
+   const precedingClasses=lines.slice(Math.max(0,ix-45),ix).map(l=>{
+    const firstX=l.items[0]?.x??0;
+    const headingText=l.items.filter(it=>it.x<firstX+230&&!/^20\d\d$/.test(it.str.trim())).slice(0,6).map(it=>it.str).join(' ');
+    return {name:totalExpenseClassHeading(headingText),y:l.y};
+   }).filter(x=>x.name&&x.y>metric.y&&x.y-metric.y<310).sort((a,b)=>a.y-b.y);
+   if(!precedingClasses.length||!totalExpenseClassMatches(precedingClasses[0].name,className))continue;
+   // Require the exact document reporting year printed above the cell in
+   // the SAME column. Other-year figures or first-column assumptions fail.
+   const printedYears=lines.slice(Math.max(0,ix-45),ix).flatMap(l=>l.items.filter(it=>/^20\d\d$/.test(it.str.trim())&&l.y>metric.y&&l.y-metric.y<310).map(it=>({year:Number(it.str.trim()),x:it.x,y:l.y})));
+   for(const cell of explicitCells){
+    const yearMarkers=printedYears.filter(it=>Math.abs(it.x-cell.x)<25);
+    if(!yearMarkers.length)continue;
+    yearMarkers.sort((a,b)=>a.y-b.y);
+    // If two year rows share one x, the closest header determines the period.
+    if(yearMarkers[0].year!==year)continue;
+    hits.push({page:page.page,value:cell.value,box:cell.box,raw:cell.raw,isMissing:cell.isMissing,kind:'strict-total-expense-ratio-cell'});
+   }
+  }
+ }
+ // Multiple possible cells are ambiguous. Do not select by number alone.
+ return hits.length===1?hits[0]:null;
 }
 
 const nbi={
@@ -490,8 +595,158 @@ const profile_scotia={key:'scotia',label:'ScotiaFunds / 1832 Asset Management',s
 const fmcConfig_scotia={issuerPrefix:/^Scotia\s/i};
 
 
+const profile_capital_group={
+ key:'capital_group',label:'Capital Group',style:'capital_group',
+ signatures:[/Capital\s+International Asset Management\s*\(Canada\),?\s*Inc\.?/i,
+             /Capital Group\s+(?:Canadian|Global|International|Multi-Sector)[^\n]*?(?:Fund|ETF)\b/i],
+ title:/^\s*(Capital Group\s+[^\n]{5,110}?(?:Fund|ETF)\s*\(Canada\))\s*$/im
+};
+const fmcConfig_capital_group={allowRowFallback:false};
 
-function extract_nbi(pages,p,fund,date){return simpleTable(pages,p);}
+
+const profile_arrow_capital={
+ key:'arrow_capital',label:'Arrow Capital Management Inc.',style:'arrow_capital',
+ signatures:[/Arrow\s+Capital\s+Management\s+Inc\.?/i],
+ title:/^\s*([A-Z][A-Z0-9&'’().,\- ]{8,140}\bFUND)\s*$/m
+};
+const fmcConfig_arrow_capital={allowRowFallback:false,titleScanPages:3};
+
+
+const profile_guardian={
+ key:'guardian',
+ label:'Guardian Capital',
+ style:'guardian',
+ signatures:[/Guardian Capital LP/i,/www\.guardiancapital\.com\/investmentsolutions/i],
+ title:/^\s*(GUARDIAN[\s\S]{5,150}?(?:FUND|ETF))\s*$/im
+};
+
+const fmcConfig_guardian={issuerPrefix:/^GUARDIAN\s/i,titleScanPages:4};
+
+function identifyFundEarly_guardian(pages,profile,head){
+ const dateRx=/^(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+\d{1,2},?\s+20\d{2}$/i;
+ for(const pg of pages.slice(0,3)){
+  const items=Array.isArray(pg.items)?pg.items.filter(it=>typeof it.str==='string'&&it.str.trim()&&Number.isFinite(it.x)&&Number.isFinite(it.y)):[];
+  const report=items.find(it=>/MANAGEMENT REPORT OF FUND PERFORMANCE/i.test(it.str));
+  const date=items.find(it=>dateRx.test(String(it.str||'').trim()));
+  if(report&&date){
+   const region=items.filter(it=>it.y<report.y-5&&it.y>date.y+5);
+   const groups=[];
+   for(const it of region){
+    let line=groups.find(x=>Math.abs(x.y-it.y)<1.8);
+    if(!line){line={y:it.y,items:[]};groups.push(line);}
+    line.items.push({...it,str:String(it.str).trim()});
+   }
+   groups.sort((a,b)=>b.y-a.y);
+   // PDF.js can place a superscript trademark digit (e.g. the 3 in i3)
+   // on a separate baseline. Reattach only a single digit that touches
+   // the end of a word on the immediately lower title line.
+   for(const line of groups){
+    for(const mark of line.items){
+     if(!/^\d$/.test(mark.str))continue;
+     const below=groups.filter(g=>g.y<line.y&&line.y-g.y<18).sort((a,b)=>b.y-a.y)[0];
+     if(!below)continue;
+     const owner=below.items.find(it=>Math.abs((it.x+(Number(it.w)||0))-mark.x)<3.5);
+     if(owner&&/[A-Za-z]$/.test(owner.str)){owner.str+=mark.str;mark.str='';}
+    }
+   }
+   const title=groups.map(g=>g.items.sort((a,b)=>a.x-b.x)
+     .map(it=>it.str).filter(t=>t&&!/^(?:TM|™|®)$/i.test(t)).join(' '))
+     .filter(Boolean).join(' ').replace(/\s+/g,' ').replace(/-\s+/g,'-').trim();
+   if(/\b(?:FUND|ETF|PORTFOLIO|POOL)\b$/i.test(title)&&title.length>=12&&title.length<190)return title;
+  }
+  // Text-only fallback for synthetic tests or source pages without PDF.js geometry.
+  const lines=String(pg.text||'').split(/\r?\n/).map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean);
+  const marker=lines.findIndex(x=>/^(?:ANNUAL|INTERIM)\s+MANAGEMENT REPORT OF FUND PERFORMANCE/i.test(x));
+  if(marker>=0){
+   const parts=[];
+   for(const line of lines.slice(marker+1,marker+7)){
+    if(dateRx.test(line))break;
+    if(/^(?:TM|™|®|\d)$/i.test(line))continue;
+    parts.push(line);
+    const candidate=parts.join(' ').replace(/\s+/g,' ').replace(/-\s+/g,'-').trim();
+    if(/\b(?:FUND|ETF|PORTFOLIO|POOL)\b$/i.test(candidate)&&candidate.length>=12)return candidate;
+   }
+  }
+ }
+ return undefined;
+}
+
+
+const profile_beutel_goodman={
+ key:'beutel_goodman',label:'Beutel Goodman',style:'beutel_goodman',
+ signatures:[/Beutel\s+Goodman\s+Managed\s+Funds/i,/Beutel,\s*Goodman\s*&\s*Company\s+Ltd\.?/i],
+ title:/^\s*(Beutel\s+Goodman\s*[^\n]{2,130}?\b(?:Fund|ETF))\s*$/im
+};
+const fmcConfig_beutel_goodman={allowRowFallback:false,titleScanPages:3};
+
+
+const profile_canada_life={
+ key:'canada_life',
+ label:'Canada Life Investment Management Ltd.',
+ style:'canada_life',
+ signatures:[/Canada\s+Life\s+Investment\s+Management\s+Ltd\.?/i],
+ title:null
+};
+const fmcConfig_canada_life={preferProfileLineTitle:true,titleScanPages:3,allowRowFallback:false};
+function identifyFundEarly_canada_life(pages,profile,head){
+ const candidates=new Set();
+ for(const page of (pages||[]).slice(0,3)){
+  for(const raw of String(page.text||'').split(/\r?\n/)){
+   const line=canadaLifeNormalize(raw);
+   if(line!==line.toUpperCase()||!/^CANADA\s+LIFE\s+[A-Z0-9&'’().,\- ]{5,150}\bFUND$/.test(line))continue;
+   candidates.add(line);
+  }
+ }
+ if(candidates.size===1)return [...candidates][0];
+ if(candidates.size>1)return 'Unknown Fund';
+ return undefined;
+}
+
+
+const profile_ccl={
+ key:'ccl',label:'CC&L Funds Inc.',style:'ccl',
+ signatures:[/www\.cclfundsinc\.com/i,/CC&L\s+Interim\s+Management\s+Report\s+of\s+Fund\s+Performance/i],
+ title:/^\s*(CC&L\s+[^\n]{4,130}?\bFund)\s*$/im
+};
+const fmcConfig_ccl={issuerPrefix:/^CC&L\s/i,titleScanPages:3,allowRowFallback:false};
+
+
+const profile_sei={
+ key:'sei',label:'SEI Investments Canada Company',style:'sei',
+ signatures:[/SEI Investments Canada Company\s*\(\s*the\s*[“\"']?Manager[”\"']?\s*\)/i,/SEI\s+Funds\s+for\s+the\s+period\s+ending/i,/seic\.com\/en-ca/i]
+};
+const fmcConfig_sei={titleScanPages:3,allowRowFallback:false};
+
+
+
+// A combined published series heading represents one Financial Highlights
+// table, not two separate sets of financial ratios. Preserve the complete
+// label for that table; independently published Series F / Private Series
+// headings are still parsed as separate records by the ordinary path.
+function combinedPrivateHeading_nbi(line){
+ const text=String(line||'').replace(/\u00a0/g,' ').replace(/\*+\s*$/,'').trim();
+ const match=/^(Series\s+[A-Z][A-Z0-9-]*)\s*\/\s*(Private\s+Series)$/i.exec(text);
+ return match?{first:match[1].replace(/\s+/g,' ').trim(),second:match[2].replace(/\s+/g,' ').trim()}:null;
+}
+function extract_nbi(pages,p,fund,date){
+ return simpleTable(pages,p);
+}
+// Prefer an explicitly printed Meritage fund title on the cover over a
+// different NBI underlying holding mentioned later in the document.
+// This branch does not run for existing NBI-branded cover titles.
+function identifyFundEarly_nbi(pages,p,head){
+ if(p.key!=='nbi'||!pages.length)return;
+ const cover=String(pages[0].text||'').split(/\r?\n/).slice(0,16).map(clean);
+ if(!cover.some(l=>/^(?:ANNUAL|INTERIM)\s+MANAGEMENT\s+REPORT\s+OF\s+FUND\s+PERFORMANCE$/i.test(l)))return;
+ const candidates=cover.filter(l=>/^Meritage(?:\s+[A-Za-z][A-Za-z0-9&'’.-]*){1,15}\s+Portfolio$/i.test(l));
+ const confirmed=candidates.filter(name=>pages.slice(1,4).some(pg=>
+   String(pg.text||'').split(/\r?\n/).some(line=>clean(line)===name)));
+ if(!confirmed.length)return;
+ confirmed.sort((a,b)=>b.length-a.length);
+ // A tie between differently named longest cover titles is ambiguous.
+ if(confirmed.length>1&&confirmed[0].length===confirmed[1].length&&confirmed[0]!==confirmed[1])return;
+ return confirmed[0];
+}
 // Adapter-owned fund title strategy (original v6 rule, unchanged).
 function identifyFundFallback_nbi(pages,p,head){
 if(p.key==='nbi'){
@@ -504,7 +759,11 @@ if(p.key==='nbi'){
 // Class heading recognition is issuer-owned; shared core only dispatches.
 function classHeading_nbi(line){
  const style='nbi';const s=line.replace(/\u00a0/g,' ').replace(/\*+/g,'').trim();let m;
- if(style==='nbi'){m=nbiClass.exec(s);return m?m[1].replace(/\s+/g,' ').trim():null;}
+ if(style==='nbi'){
+  const combined=combinedPrivateHeading_nbi(s);
+  if(combined)return combined.first+' / '+combined.second;
+  m=nbiClass.exec(s);return m?m[1].replace(/\s+/g,' ').trim():null;
+ }
  return null;
 }
 
@@ -2236,9 +2495,950 @@ function auditRatioHeadings_scotia(source,potential){
 }
 
 
+// Prefer the full publication footer over a multi-line graphic cover or
+// narrative references to underlying investments. Both footer orientations
+// ("4 Capital Group ..." and "Capital Group ... 5") are supported.
+function identifyFundEarly_capital_group(pages,profile,head){
+ const names=new Set();
+ for(const page of pages.slice(1,9)){
+  for(const raw of String(page.text||'').split(/\r?\n/)){
+   const candidate=raw.trim().replace(/^\d{1,2}\s+/,'').replace(/\s+\d{1,2}$/,'').replace(/[®™]/g,'').replace(/\s+/g,' ');
+   if(/^Capital Group\s+[A-Za-z][\w\s-]{7,115}\s+(?:Fund|ETF)\s*\(Canada\)$/i.test(candidate))names.add(candidate);
+  }
+  if(names.size===1)return [...names][0];
+  if(names.size>1)return 'Unknown Fund';
+ }
+ return undefined;
+}
+function selectReportDate_capital_group(pages){
+ // Reporting periods on cover and in ratio table must agree; the generic
+ // date reader prioritizes the cover's "Six Months Ended" headline.
+ const date=reportDate(pages);
+ return date;
+}
+function capitalGroupFinancialRowTokens(tail,isEtf){
+ const cells=String(tail||'').match(/(?:\$\s*)?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?|[—–−-]/g)||[];
+ if(cells.length!==(isEtf?8:7))return null;
+ // Assets, units, actual MER, before-waivers MER, Trading expenses,
+ // portfolio turnover, NAV, [ETF closing market price].
+ const parse=s=>toNumber(s.replace(/^\$\s*/,''));
+ const values=cells.map(parse);
+ if(values[0]===null||values[1]===null||values[6]===null||
+    values.some(v=>v!==null&&(!Number.isFinite(v)||v<0))||
+    values[2]!==null&&values[2]>100||values[5]!==null&&values[5]>1000)return null;
+ return {MER:values[2],TER:null,PTR:values[5]};
+}
+function extract_capital_group(pages,profile,fund,date){
+ if(!/^Capital Group\s+.+\s+(?:Fund|ETF)\s*\(Canada\)$/i.test(fund||'')||
+    !/^20\d\d-\d\d-\d\d$/.test(date||''))return [];
+ const isEtf=/\bETF\s*\(Canada\)$/i.test(fund),out=new Map(),conflicts=new Set();
+ for(const pg of pages){
+  const text=String(pg.text||'');
+  if(!/\bRatios and Supplemental Data\b/i.test(text)||
+     !text.toLowerCase().includes(fund.toLowerCase()))continue;
+  const lines=text.split(/\r?\n/);
+  const index=lines.findIndex(l=>/^Ratios and Supplemental Data\b/i.test(l.trim()));
+  if(index<0)continue;
+  const header=lines.slice(index,index+12).join(' ');
+  // Verify the complete printed column order. The MER and the second MER
+  // before waivers may have identical numbers but are NOT interchangeable.
+  if(!/Management\s+Before Waivers or\s+Trading\s+Portfolio\s+Net Asset/i.test(header)||
+     !/Expense Ratio\s+Absorptions\s+Expense Ratio\s+Turnover Rate/i.test(header))continue;
+  let cls=isEtf?'ETF Units':null;
+  for(let i=index+1;i<lines.length;i++){
+   const s=lines[i].trim();
+   if(/^Refer to page\b/i.test(s)||/^(?:Management Fees|Past Performance)\b/i.test(s))break;
+   const heading=/^Series\s+([A-Z](?:\d+)?)(?:\s*\d+(?:,\d+)*)?\s*$/i.exec(s);
+   if(heading){cls=isEtf?null:'Series '+heading[1].toUpperCase();continue;}
+   const m=/^(?:Period|Year) ended\s+(\d{1,2})\/(\d{1,2})\/(20\d{2})\s+(.+)$/i.exec(s);
+   if(!m||!cls)continue;
+   const printed=`${m[3]}-${m[1].padStart(2,'0')}-${m[2].padStart(2,'0')}`;
+   if(printed!==date)continue;
+   const values=capitalGroupFinancialRowTokens(m[4],isEtf);
+   if(!values)continue;
+   const found={cls,values,quality:3,evidence:{
+     ...(values.MER!==null?{MER:{page:pg.page,source:'Current-period Management Expense Ratio column',method:'native-js'}}:{}),
+     ...(values.PTR!==null?{PTR:{page:pg.page,source:'Current-period Portfolio Turnover Rate column',method:'native-js'}}:{})
+   }};
+   if(out.has(cls)&&JSON.stringify(out.get(cls).values)!==JSON.stringify(found.values))conflicts.add(cls);
+   else out.set(cls,found);
+  }
+ }
+ for(const cls of conflicts)out.delete(cls); // Conflicting disclosures fail closed.
+ return [...out.values()];
+}
+function auditRatioHeadings_capital_group(pageText,potential){
+ const text=String(pageText||'');if(!/Ratios and Supplemental Data/i.test(text))return;
+ const section=text.slice(text.search(/Ratios and Supplemental Data/i));
+ const series=[...section.matchAll(/^Series\s+([A-Z](?:\d+)?)(?:\s*\d+(?:,\d+)*)?\s*$/gim)];
+ if(series.length)for(const m of series)potential.add('Series '+m[1].toUpperCase());
+ else if(/\b(?:Period|Year) ended\s+\d{1,2}\/\d{1,2}\/20\d\d/i.test(section))potential.add('ETF Units');
+}
+
+
+function arrowCapitalNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-')
+  .replace(/\s*-\s*/g,'-').replace(/\s+/g,' ').trim();
+}
+function arrowCapitalCompact(value){
+ return arrowCapitalNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+function arrowCapitalTitleCase(value){
+ const lower=String(value||'').toLowerCase();
+ return lower.replace(/\b[a-z][a-z0-9']*/g,word=>
+  /^(?:and|of|the|for|in|on|to|at|by)$/i.test(word)?word:word.charAt(0).toUpperCase()+word.slice(1));
+}
+function identifyFundEarly_arrow_capital(pages,profile,head){
+ const candidates=new Set();
+ for(const page of pages.slice(0,3)){
+  for(const raw of String(page.text||'').split(/\r?\n/)){
+   const line=String(raw||'').trim().replace(/\s+/g,' ');
+   if(!/^[A-Z][A-Z0-9&'’().,\- ]{8,140}\bFUND$/.test(line))continue;
+   if(/\b(?:ANNUAL|SEMI-ANNUAL|MANAGEMENT REPORT|FUND PERFORMANCE|FINANCIAL STATEMENTS|FINANCIAL HIGHLIGHTS)\b/.test(line))continue;
+   candidates.add(line);
+  }
+ }
+ if(candidates.size===1)return arrowCapitalTitleCase([...candidates][0]);
+ if(candidates.size>1)return 'Unknown Fund';
+ return undefined;
+}
+function selectReportDate_arrow_capital(pages){
+ const text=pages.slice(0,6).map(page=>String(page.text||'')).join('\n');
+ const monthMap={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+ const match=/\b(?:year|period)\s+ended\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(20\d{2})\b/i.exec(text);
+ if(match)return `${match[3]}-${monthMap[match[1].slice(0,3).toLowerCase()]}-${match[2].padStart(2,'0')}`;
+ return reportDate(pages);
+}
+function arrowCapitalSeriesHeading(line){
+ const text=arrowCapitalNormalize(line).toUpperCase();
+ const match=/^SERIES\s+([A-Z][A-Z0-9]*)\s*(?:\(\s*RE-DESIGNATED\s+FROM\s+([A-Z0-9][A-Z0-9 ]*?)\s*\))?$/.exec(text);
+ if(!match)return null;
+ const code=match[1].toUpperCase();
+ const canonical=`Series ${code}`;
+ const alias=match[2]?match[2].trim().replace(/\s+/g,' ').replace(/\bSERIES\b/i,'Series'):null;
+ const display=alias?`${canonical} (re-designated from ${alias})`:canonical;
+ return {cls:canonical,displayCls:display,aliases:alias?[alias]:[]};
+}
+function arrowCapitalYearHeader(lines,sectionIndex,year){
+ const candidates=lines.slice(Math.max(0,sectionIndex-9),sectionIndex)
+  .map(line=>({line,years:[...String(line).matchAll(/\b(20\d{2})\b/g)].map(match=>Number(match[1]))}))
+  .filter(item=>item.years.length&&item.years[0]===year);
+ return candidates.length?candidates[candidates.length-1].line:null;
+}
+function arrowCapitalFirstRatioCell(line,labelPattern){
+ const text=arrowCapitalNormalize(line);
+ const label=labelPattern.exec(text);
+ if(!label)return {found:false,value:null};
+ let tail=text.slice(label[0].length);
+ // PDF.js may put a superscript footnote marker into the flattened row text.
+ // Remove only a standalone small integer; never strip the leading ratio.
+ tail=tail.replace(/^\s*(?:\(?\d{1,2}\)?)(?=\s|$)\s*/,'');
+ const cell=/^\s*(N\/?A|[—–−-]{1,2}|(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*%\*?)/i.exec(tail);
+ if(!cell)return {found:false,value:null};
+ const raw=cell[1].replace(/\s+/g,'');
+ if(/^(?:N\/?A|[—–−-]{1,2})$/i.test(raw))return {found:true,value:null};
+ // MER and PTR must be explicitly published as percentages in this table.
+ if(!/%/.test(raw))return {found:false,value:null};
+ const value=Number(raw.replace(/[,%*]/g,''));
+ return {found:Number.isFinite(value)&&value>=0,value:Number.isFinite(value)&&value>=0?value:null};
+}
+function arrowCapitalRatioPage(page,fund,date){
+ const text=String(page.text||'');
+ if(!arrowCapitalCompact(text).includes(arrowCapitalCompact(fund))||
+    !/Ratios\s+and\s+Supplemental\s+Data/i.test(text))return null;
+ const lines=text.split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+ const sectionIndex=lines.findIndex(line=>/^Ratios\s+and\s+Supplemental\s+Data\b/i.test(line));
+ if(sectionIndex<0)return null;
+ const year=Number(String(date||'').slice(0,4));
+ if(!year||!arrowCapitalYearHeader(lines,sectionIndex,year))return null;
+ let heading=null;
+ for(let i=sectionIndex-1;i>=Math.max(0,sectionIndex-10);i--){
+  const parsed=arrowCapitalSeriesHeading(lines[i]);
+  if(parsed){heading=parsed;break;}
+ }
+ if(!heading)return null;
+ const merLine=lines.slice(sectionIndex+1).find(line=>
+  /^Management\s+expense\s+ratio(?=\s|$|\d)(?!\s+before\b)/i.test(line));
+ const ptrLine=lines.slice(sectionIndex+1).find(line=>/^Portfolio\s+turnover\s+rate(?=\s|$|\d)/i.test(line));
+ const mer=merLine?arrowCapitalFirstRatioCell(merLine,/^Management\s+expense\s+ratio(?=\s|$|\d)(?!\s+before\b)/i):{found:false,value:null};
+ const ptr=ptrLine?arrowCapitalFirstRatioCell(ptrLine,/^Portfolio\s+turnover\s+rate(?=\s|$|\d)/i):{found:false,value:null};
+ if(!mer.found&&!ptr.found)return null;
+ return {cls:heading.cls,displayCls:heading.displayCls,aliases:heading.aliases,quality:3,
+  values:{MER:mer.found?mer.value:null,TER:null,PTR:ptr.found?ptr.value:null},
+  evidence:{
+   ...(mer.found&&mer.value!==null?{MER:{page:page.page,source:'Current-period Management Expense Ratio (MER) row',method:'native-js'}}:{}),
+   ...(ptr.found&&ptr.value!==null?{PTR:{page:page.page,source:'Current-period Portfolio Turnover Rate row',method:'native-js'}}:{})
+  }};
+}
+function extract_arrow_capital(pages,profile,fund,date){
+ if(!fund||fund==='Unknown Fund'||!/^20\d\d-\d\d-\d\d$/.test(date||''))return [];
+ const bySeries=new Map(),conflicts=new Set();
+ for(const page of pages){
+  const found=arrowCapitalRatioPage(page,fund,date);if(!found)continue;
+  const old=bySeries.get(found.cls);
+  if(!old)bySeries.set(found.cls,found);
+  else if(JSON.stringify(old.values)!==JSON.stringify(found.values)||old.displayCls!==found.displayCls)conflicts.add(found.cls);
+ }
+ for(const cls of conflicts)bySeries.delete(cls);
+ return [...bySeries.values()];
+}
+function auditRatioHeadings_arrow_capital(pageText,potential){
+ const text=String(pageText||'');if(!/Ratios\s+and\s+Supplemental\s+Data/i.test(text))return;
+ for(const line of text.split(/\r?\n/)){
+  const heading=arrowCapitalSeriesHeading(line.trim());
+  if(heading)potential.add(heading.cls);
+ }
+}
+
+
+// Normalize text without changing the class identity or collapsing combined headings.
+function guardianNormalize(s){return String(s||'').normalize('NFKC').replace(/\u00ad/g,'').replace(/\s+/g,' ').trim();}
+function guardianCompact(s){return guardianNormalize(s).toLowerCase().replace(/[^a-z0-9]/g,'');}
+function guardianClassName(s){
+ let value=guardianNormalize(s).replace(/^(?:Series|Class)\s+/i,m=>m[0].toUpperCase()+m.slice(1));
+ // Parenthetical "formerly ..." text is a product alias, not a second class.
+ value=value.replace(/\s*\(formerly\b[^)]*\)\s*$/i,'').trim();
+ return value;
+}
+function guardianClassFromHeading(line){
+ const text=guardianNormalize(line);
+ const m=/^Ratios?\s+(?:and|&)\s+Supplemental\s+Data\s*\((.+)\)\s*$/i.exec(text);
+ if(!m)return null;
+ const cls=guardianClassName(m[1]);
+ return cls||null;
+}
+function classHeading_guardian(line){
+ const t=guardianNormalize(line);
+ const m=/^((?:Series|Class)\s+[A-Z0-9][A-Z0-9\s&/'-]*|(?:ETF|CAD|USD)\s+(?:Units?|Series)|[A-Z][A-Z0-9-]*\s+(?:Shares?|Units?))(?:\s+\(formerly\b.*\))?$/i.exec(t);
+ return m?guardianClassName(m[1]):null;
+}
+function guardianClassNearHeading(lines,index){
+ for(let i=index-1;i>=Math.max(0,index-10);i--){
+  const m=/Net Assets per Unit\s*\((.+)\)\s*$/i.exec(guardianNormalize(lines[i]));
+  if(m){const cls=guardianClassName(m[1]);if(cls)return cls;}
+ }
+ for(let i=index+1;i<Math.min(lines.length,index+4);i++){
+  const cls=classHeading_guardian(lines[i]);
+  if(cls)return cls;
+ }
+ return null;
+}
+function guardianMetric(line,key){
+ const t=guardianNormalize(line);
+ const label=key==='MER'?/^Management\s+expense\s+ratio\b/i:/^Portfolio\s+turnover\s+(?:rate|ratio)\b/i;
+ const m=label.exec(t);if(!m)return {found:false,value:null};
+ if(key==='MER'&&/\bbefore\s+waivers\b|\babsorptions\b/i.test(t))return {found:false,value:null};
+ let tail=t.slice(m[0].length).replace(/^\s*(?:(?:\[\d+\])|(?:\(\d+\))|(?:\(\s*%\s*\)))\s*/,'').trim();
+ const token=/(?:N\/?A|[—–−-]{1,2}|-?\d{1,3}(?:,\d{3})*(?:\.\d+)?\s*%?)/i.exec(tail);
+ if(token){
+  const raw=token[0].replace(/\s/g,'');
+  if(/^(?:N\/?A|[—–−-]{1,2})$/i.test(raw))return {found:true,value:null};
+  const n=Number(raw.replace(/[,%]/g,''));
+  return {found:true,value:Number.isFinite(n)?n:null};
+ }
+ return {found:false,value:null};
+}
+function guardianDateText(date){
+ const m=/^(20\d{2})-(\d{2})-(\d{2})$/.exec(date||'');if(!m)return null;
+ const months=['January','February','March','April','May','June','July','August','September','October','November','December'];
+ return `${months[Number(m[2])-1]} ${Number(m[3])}, ${m[1]}`;
+}
+function guardianDateColumnCenter(items,sectionY,iso){
+ if(!Array.isArray(items))return null;
+ const month=['January','February','March','April','May','June','July','August','September','October','November','December'][Number(iso[2])-1];
+ const monthPrefix=month.slice(0,3)+'[a-z]*';
+ const day=Number(iso[3]),year=iso[1];
+ const fullRx=new RegExp('^'+monthPrefix+'\\.?\\s+'+day+',?\\s+'+year+'$','i');
+ const monthDayRx=new RegExp('^'+monthPrefix+'\\.?\\s+'+day+',?$','i');
+ const monthOnlyRx=new RegExp('\\b'+monthPrefix+'\\b','i');
+ const dayYearRx=new RegExp('^'+day+',?\\s+'+year+'$','i');
+ const yearRx=new RegExp('^'+year+'$');
+ const nearby=items.filter(it=>Number.isFinite(it.x)&&Number.isFinite(it.y)&&it.y<sectionY&&sectionY-it.y<145);
+ const center=it=>it.x+(Number(it.w)||0)/2;
+ const direct=nearby.filter(it=>fullRx.test(guardianNormalize(it.str)));
+ if(direct.length===1)return center(direct[0]);
+ if(direct.length>1)return null;
+ const dateItems=nearby.filter(it=>monthDayRx.test(guardianNormalize(it.str)));
+ const monthItems=nearby.filter(it=>monthOnlyRx.test(guardianNormalize(it.str)));
+ const dayYearItems=nearby.filter(it=>dayYearRx.test(guardianNormalize(it.str)));
+ const yearItems=nearby.filter(it=>yearRx.test(guardianNormalize(it.str)));
+ const centers=[];
+ for(const d of dateItems)for(const y of yearItems)
+  if(Math.abs(center(d)-center(y))<22&&Math.abs(d.y-y.y)<40)centers.push(center(y));
+ for(const m of monthItems)for(const dy of dayYearItems)
+  if(Math.abs(center(m)-center(dy))<22&&Math.abs(m.y-dy.y)<40)centers.push(center(dy));
+ const unique=[...new Set(centers.map(x=>Math.round(x*10)/10))];
+ return unique.length===1?unique[0]:null;
+}
+function guardianHasCurrentPeriod(block,date,page,sectionHeading){
+ const wanted=guardianDateText(date);
+ if(!wanted)return false;
+ const compact=s=>guardianNormalize(s).replace(/[,]/g,'').toLowerCase();
+ if(compact(block).includes(compact(wanted)))return true;
+ const iso=/^(20\d{2})-(\d{2})-(\d{2})$/.exec(date||'');
+ if(!iso||!Array.isArray(page?.items))return false;
+ const month=['January','February','March','April','May','June','July','August','September','October','November','December'][Number(iso[2])-1];
+ const heading=guardianNormalize(sectionHeading||'');
+ const section=page.items.find(it=>guardianNormalize(it.str)===heading&&/Ratios?\s+(?:and|&)\s+Supplemental\s+Data/i.test(it.str))
+  ||page.items.find(it=>/Ratios?\s+(?:and|&)\s+Supplemental\s+Data/i.test(String(it.str||'')));
+ if(section&&Number.isFinite(guardianDateColumnCenter(page.items,section.y,iso)))return true;
+ // Some multi-column annual headers interleave text from adjacent columns,
+ // so month/day and year are not contiguous in the flattened text stream.
+ // Keep this fallback scoped to the same ratio-table block and the report's
+ // exact month/day/year; evidence still requires an aligned source column.
+ const blockText=guardianNormalize(block);
+ const monthDayRx=new RegExp(month.slice(0,3)+'[a-z]*\\.?\\s+'+Number(iso[3])+',?','i');
+ return monthDayRx.test(blockText)&&new RegExp('\\b'+iso[1]+'\\b').test(blockText);
+}
+function guardianRatioSections(pages,fund,date){
+ const sections=[];
+ for(const page of pages){
+  const lines=String(page.text||'').split(/\r?\n/).map(guardianNormalize);
+  for(let i=0;i<lines.length;i++){
+   if(!/^Ratios?\s+(?:and|&)\s+Supplemental\s+Data\b/i.test(lines[i]))continue;
+   const next=i+1;let end=next;
+   while(end<lines.length&&!/^Ratios?\s+(?:and|&)\s+Supplemental\s+Data\b/i.test(lines[end]))end++;
+   const block=lines.slice(i,end).join('\n');
+   if(!guardianHasCurrentPeriod(block,date,page,lines[i]))continue;
+   let cls=guardianClassFromHeading(lines[i])||guardianClassNearHeading(lines,i);
+   sections.push({page,lines,headingIndex:i,endIndex:end,block,cls});
+  }
+ }
+ // A genuine single fund-level ratio table may omit any Series/Class heading.
+ // Do not invent a class when a multi-table document makes the identity ambiguous.
+ if(sections.length===1&&!sections[0].cls)sections[0].cls='Fund';
+ return sections.filter(s=>s.cls);
+}
+function extract_guardian(pages,p,fund,date){
+ const reportDateValue=date||reportDate(pages);
+ if(!reportDateValue||!fund||fund==='Unknown Fund')return [];
+ const sections=guardianRatioSections(pages,fund,reportDateValue);
+ const byClass=new Map();
+ for(const section of sections){
+  const values={MER:null,TER:null,PTR:null},evidence={};
+  let seen=0;
+  for(const key of ['MER','PTR']){
+   const labelRx=key==='MER'?/^Management\s+expense\s+ratio\b/i:/^Portfolio\s+turnover\s+(?:rate|ratio)\b/i;
+   const line=section.lines.slice(section.headingIndex+1,section.endIndex)
+    .find(t=>labelRx.test(t)&&!(key==='MER'&&/\bbefore\s+waivers\b|\babsorptions\b/i.test(t)));
+   if(!line)continue;
+   const parsed=guardianMetric(line,key);
+   if(!parsed.found)continue;
+   values[key]=parsed.value;seen++;
+   evidence[key]={page:section.page.page,source:`${key} (Guardian current-period ratio table)`,method:'native-js'};
+  }
+  if(!seen)continue;
+  const old=byClass.get(section.cls);
+  if(!old)byClass.set(section.cls,{cls:section.cls,values,evidence,quality:3});
+  else{
+   for(const key of ['MER','PTR']){
+    if(!Object.hasOwn(old.evidence,key)&&Object.hasOwn(evidence,key)){
+     old.values[key]=values[key];old.evidence[key]=evidence[key];
+    }else if(Object.hasOwn(old.evidence,key)&&Object.hasOwn(evidence,key)&&old.values[key]!==values[key]){
+     delete old.evidence[key];old.values[key]=null;
+    }
+   }
+  }
+ }
+ return [...byClass.values()];
+}
+function auditRatioHeadings_guardian(source,potential){
+ const lines=String(source||'').split(/\r?\n/);
+ for(const line of lines){
+  const cls=guardianClassFromHeading(line);
+  if(cls)potential.add(cls);
+ }
+}
+
+
+function beutelGoodmanNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();
+}
+function beutelGoodmanCompact(value){
+ return beutelGoodmanNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+function beutelGoodmanClassHeading(line){
+ const match=/^Class\s+([A-Z0-9][A-Z0-9-]*)\s+Units?$/i.exec(beutelGoodmanNormalize(line));
+ return match?'Class '+match[1].toUpperCase():null;
+}
+function classHeading_beutel_goodman(line){return beutelGoodmanClassHeading(line);}
+function identifyFundEarly_beutel_goodman(pages,profile,head){
+ const candidates=new Set();
+ for(const page of (pages||[]).slice(0,3)){
+  for(const raw of String(page.text||'').split(/\r?\n/)){
+   const line=beutelGoodmanNormalize(raw);
+   const match=/^Beutel\s+Goodman\s*(.{2,130}\b(?:Fund|ETF))$/i.exec(line);
+   if(match&&!/^Managed\s+Funds$/i.test(match[1].trim()))candidates.add('Beutel Goodman '+match[1].trim());
+  }
+ }
+ if(candidates.size===1)return [...candidates][0];
+ if(candidates.size>1)return 'Unknown Fund';
+ return undefined;
+}
+function selectReportDate_beutel_goodman(pages){
+ const text=(pages||[]).slice(0,9).map(page=>String(page.text||'')).join('\n');
+ const match=/\b(?:Interim|Annual)\s+Management\s+Report\s+of\s+Fund\s+Performance\s+as\s+of\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(20\d{2})\b/i.exec(text);
+ if(match){
+  const months={january:'01',february:'02',march:'03',april:'04',may:'05',june:'06',july:'07',august:'08',september:'09',october:'10',november:'11',december:'12'};
+  return `${match[3]}-${months[match[1].toLowerCase()]}-${match[2].padStart(2,'0')}`;
+ }
+ return reportDate(pages);
+}
+function beutelGoodmanCurrentHeader(lines,index,date){
+ const match=/^(20\d{2})-(\d{2})-(\d{2})$/.exec(date||'');
+ if(!match)return null;
+ const monthNames=['January','February','March','April','May','June','July','August','September','October','November','December'];
+ const month=monthNames[Number(match[2])-1];
+ if(!month)return null;
+ for(let i=index+1;i<Math.min(lines.length,index+9);i++){
+  const line=beutelGoodmanNormalize(lines[i]);
+  const dateRx=new RegExp('\\b'+month+'\\s+'+match[1]+'\\b','i');
+  if(!dateRx.test(line))continue;
+  const years=[...line.matchAll(/\b(20\d{2})\b/g)].map(item=>Number(item[1]));
+  if(!years.length||years[0]!==Number(match[1]))continue;
+  // The header must include the current period and historical year columns.
+  if(years.length<2||years.slice(1).some((year,i)=>year>=years[i]))continue;
+  return {line,index:i,yearCount:years.length};
+ }
+ return null;
+}
+function beutelGoodmanRatioTokens(text){
+ const tokens=[];
+ const rx=/(?:^|\s)(N\/?A|[—–−-]{1,2}|(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\s*%)(?=\s|$)/gi;
+ let match;
+ while((match=rx.exec(String(text||''))))tokens.push(match[1].replace(/\s+/g,''));
+ return tokens;
+}
+function beutelGoodmanReadMetric(lines,index,expectedCount,key){
+ const labelRx=key==='MER'?/^Management\s+expense\s+ratio\b(?!\s+before\b)/i:/^Portfolio\s+turnover\s+rate\b/i;
+ if(!labelRx.test(beutelGoodmanNormalize(lines[index])))return {found:false,value:null};
+ let combined=beutelGoodmanNormalize(lines[index]);
+ let tokens=beutelGoodmanRatioTokens(combined.replace(labelRx,''));
+ // A few PDF.js versions may place the row's cells on the following text line.
+ for(let i=index+1;tokens.length<expectedCount&&i<Math.min(lines.length,index+4);i++){
+  if(/^(?:Management\s+expense\s+ratio|Portfolio\s+turnover\s+rate|Trading\s+expense\s+ratio)\b/i.test(beutelGoodmanNormalize(lines[i])))break;
+  combined+=' '+beutelGoodmanNormalize(lines[i]);
+  tokens=beutelGoodmanRatioTokens(combined.replace(labelRx,''));
+ }
+ if(tokens.length!==expectedCount)return {found:false,value:null};
+ const first=tokens[0];
+ if(/^(?:N\/?A|[—–−-]{1,2})$/i.test(first))return {found:true,value:null};
+ const value=Number(first.replace(/[,%]/g,''));
+ return {found:Number.isFinite(value)&&value>=0, value:Number.isFinite(value)&&value>=0?value:null};
+}
+function beutelGoodmanRatioPage(page,fund,date){
+ const text=String(page.text||'');
+ if(!beutelGoodmanCompact(text).includes(beutelGoodmanCompact(fund))||
+    !/Ratios\s+and\s+Supplemental\s+Data/i.test(text))return null;
+ const lines=text.split(/\r?\n/).map(beutelGoodmanNormalize).filter(Boolean);
+ const sectionIndexes=[];
+ for(let i=0;i<lines.length;i++)if(/^Ratios\s+and\s+Supplemental\s+Data$/i.test(lines[i]))sectionIndexes.push(i);
+ if(sectionIndexes.length!==1)return null;
+ const sectionIndex=sectionIndexes[0];
+ let cls=null;
+ for(let i=sectionIndex+1;i<Math.min(lines.length,sectionIndex+6);i++){
+  cls=beutelGoodmanClassHeading(lines[i]);
+  if(cls)break;
+  if(/^\(/.test(lines[i]))continue;
+ }
+ if(!cls)return null;
+ const header=beutelGoodmanCurrentHeader(lines,sectionIndex,date);
+ if(!header)return null;
+ const merIndexes=[],ptrIndexes=[];
+ for(let i=header.index+1;i<Math.min(lines.length,header.index+18);i++){
+  if(/^Management\s+expense\s+ratio\b(?!\s+before\b)/i.test(lines[i]))merIndexes.push(i);
+  if(/^Portfolio\s+turnover\s+rate\b/i.test(lines[i]))ptrIndexes.push(i);
+ }
+ if(merIndexes.length!==1||ptrIndexes.length!==1)return null;
+ const mer=beutelGoodmanReadMetric(lines,merIndexes[0],header.yearCount,'MER');
+ const ptr=beutelGoodmanReadMetric(lines,ptrIndexes[0],header.yearCount,'PTR');
+ if(!mer.found&&!ptr.found)return null;
+ return {cls,quality:3,values:{MER:mer.found?mer.value:null,TER:null,PTR:ptr.found?ptr.value:null},
+  evidence:{
+   ...(mer.found&&mer.value!==null?{MER:{page:page.page,source:'Current-period Management Expense Ratio row',method:'native-js'}}:{}),
+   ...(ptr.found&&ptr.value!==null?{PTR:{page:page.page,source:'Current-period Portfolio Turnover Rate row',method:'native-js'}}:{})
+  }};
+}
+function extract_beutel_goodman(pages,profile,fund,date){
+ if(!fund||fund==='Unknown Fund'||!/^20\d\d-\d\d-\d\d$/.test(date||''))return [];
+ const byClass=new Map(),conflicts=new Set();
+ for(const page of pages||[]){
+  const found=beutelGoodmanRatioPage(page,fund,date);if(!found)continue;
+  const old=byClass.get(found.cls);
+  if(!old)byClass.set(found.cls,found);
+  else if(JSON.stringify(old.values)!==JSON.stringify(found.values))conflicts.add(found.cls);
+ }
+ for(const cls of conflicts)byClass.delete(cls);
+ return [...byClass.values()];
+}
+function auditRatioHeadings_beutel_goodman(pageText,potential){
+ const lines=String(pageText||'').split(/\r?\n/).map(beutelGoodmanNormalize);
+ for(let i=0;i<lines.length;i++){
+  if(!/^Ratios\s+and\s+Supplemental\s+Data$/i.test(lines[i]))continue;
+  for(let j=i+1;j<Math.min(lines.length,i+6);j++){
+   const cls=beutelGoodmanClassHeading(lines[j]);if(cls){potential.add(cls);break;}
+  }
+ }
+}
+
+
+function canadaLifeNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00a0\u200b\u00ad]/g,' ').replace(/\s+/g,' ').trim();
+}
+function canadaLifeCompact(value){
+ return canadaLifeNormalize(value).toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+function canadaLifeClassFromHeader(line){
+ const text=canadaLifeNormalize(line?.text||'');
+ const match=/^(Premium\s+Series|[A-Z][A-Z0-9]{0,4}\s+Series|Series\s+[A-Z][A-Z0-9]{0,3})(?=\s+20\d{2}\b)/i.exec(text);
+ return match?canadaLifeNormalize(match[1]):null;
+}
+function canadaLifeDateParts(value){
+ const match=/^\s*(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2})\s*$/i.exec(canadaLifeNormalize(value));
+ if(!match)return null;
+ const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+ return {month:months[match[1].slice(0,3).toLowerCase()],day:Number(match[2])};
+}
+function canadaLifeTokenCenter(item){return Number(item?.x)+(Number(item?.w)||0)/2;}
+function canadaLifeCurrentHeader(lines,header,yearItems,date){
+ if(!yearItems.length||Number(yearItems[0].str.trim())!==Number(String(date||'').slice(0,4)))return null;
+ const iso=/^(\d{4})-(\d{2})-(\d{2})$/.exec(date||'');if(!iso)return null;
+ const month=iso[2],day=Number(iso[3]),year=Number(iso[1]);
+ const candidates=lines.filter(line=>line.y>=header.y&&line.y-header.y<=20)
+  .flatMap(line=>line.items)
+  .map(item=>({item,parts:canadaLifeDateParts(item.str)}))
+  .filter(entry=>entry.parts&&entry.parts.month===month&&entry.parts.day===day
+    &&Math.abs(canadaLifeTokenCenter(entry.item)-canadaLifeTokenCenter(yearItems[0]))<22);
+ return candidates.length===1?{x:canadaLifeTokenCenter(yearItems[0]),year}:null;
+}
+function canadaLifeTextLines(items){
+ const output=[];
+ for(const item of items||[]){
+  if(typeof item.str!=='string'||!item.str.trim()||!Number.isFinite(item.x)||!Number.isFinite(item.y))continue;
+  const height=Math.max(5,Number(item.h)||8);
+  let line=output.find(candidate=>Math.abs(candidate.y-item.y)<Math.max(1.5,Math.min(2.8,height*.25)));
+  if(!line){line={y:item.y,items:[]};output.push(line);}
+  line.items.push({...item,h:height});
+ }
+ output.sort((a,b)=>b.y-a.y);
+ for(const line of output){line.items.sort((a,b)=>a.x-b.x);line.text=line.items.map(item=>item.str).join(' ').replace(/\s+/g,' ').trim();}
+ return output;
+}
+function canadaLifeMetricCells(line){
+ const found=[];
+ for(const item of line.items||[]){
+  const raw=canadaLifeNormalize(item.str).replace(/\s+/g,'');
+  if(!(Number(item.w)>0))continue;
+  const missing=/^(?:n\/?a|[-–—−]{1,2})$/i.test(raw);
+  const numeric=/^(?:\d+(?:\.\d+)?|\.\d+)%?$/.test(raw);
+  if(!missing&&!numeric)continue;
+  const value=missing?null:Number(raw.replace('%',''));
+  if(!missing&&!Number.isFinite(value))continue;
+  found.push({value,isMissing:missing,raw,x:item.x,
+   box:{x:Math.max(0,item.x-1),y:line.y-1,w:item.w+2,h:Math.max(6,item.h||8)+2}});
+ }
+ return found.sort((a,b)=>a.x-b.x);
+}
+function canadaLifeCellAtColumn(line,columnX){
+ if(!line||!Number.isFinite(columnX))return null;
+ const candidates=canadaLifeMetricCells(line).filter(cell=>{
+  const center=cell.box?cell.box.x+cell.box.w/2:Number(cell.x);
+  return Number.isFinite(center)&&Math.abs(center-columnX)<19;
+ });
+ return candidates.length===1?candidates[0]:null;
+}
+function canadaLifePageTables(page,fund,date){
+ if(!page||!Array.isArray(page.items)||!page.items.length||page.ocrUsed)return [];
+ if(!/RATIOS\s+AND\s+SUPPLEMENTAL\s+DATA/i.test(page.text||''))return [];
+ const compactFund=canadaLifeCompact(fund);
+ if(compactFund.length<12||!canadaLifeCompact((page.text||'').slice(0,900)).includes(compactFund))return [];
+ const width=Number(page.width)||612,split=width/2,output=[];
+ for(const [minX,maxX] of [[0,split-3],[split-3,width+3]]){
+  const columnItems=page.items.filter(item=>Number.isFinite(item.x)&&item.x>=minX&&item.x<maxX);
+  const lines=canadaLifeTextLines(columnItems);
+  const headers=lines.map(line=>{
+   const cls=canadaLifeClassFromHeader(line);
+   const years=line.items.filter(item=>/^20\d{2}$/.test(String(item.str||'').trim())).sort((a,b)=>a.x-b.x);
+   return cls&&years.length>=2?{line,cls,years}:null;
+  }).filter(Boolean).filter(header=>canadaLifeCurrentHeader(lines,header.line,header.years,date));
+  headers.sort((a,b)=>b.line.y-a.line.y);
+  for(let index=0;index<headers.length;index++){
+   const header=headers[index],next=headers[index+1];
+   const lowerY=next?next.line.y:Math.max(0,header.line.y-175);
+   const block=lines.filter(line=>line.y<header.line.y-2&&line.y>lowerY+2&&line.y>header.line.y-175);
+   const merLines=block.filter(line=>/^Management\s+expense\s+ratio\s*\(\s*%\s*\)/i.test(line.text));
+   const ptrLines=block.filter(line=>/^Portfolio\s+turnover\s+rate\s*\(\s*%\s*\)/i.test(line.text));
+   if(merLines.length!==1||ptrLines.length!==1)continue;
+   const currentX=canadaLifeTokenCenter(header.years[0]);
+   const merCell=canadaLifeCellAtColumn(merLines[0],currentX);
+   const ptrCell=canadaLifeCellAtColumn(ptrLines[0],currentX);
+   if(!merCell||!ptrCell)continue;
+   output.push({
+    cls:header.cls,
+    page:page.page,
+    currentX,
+    merLine:merLines[0],ptrLine:ptrLines[0],
+    values:{MER:merCell.value??null,TER:null,PTR:ptrCell.value??null},
+    evidence:{
+     MER:{page:page.page,source:'Canada Life current-period Management Expense Ratio row',method:'native-js'},
+     PTR:{page:page.page,source:'Canada Life current-period Portfolio Turnover Rate row',method:'native-js'}
+    },
+    quality:2
+   });
+  }
+ }
+ return output;
+}
+function extract_canada_life(pages,profile,fund,date){
+ if(!fund||fund==='Unknown Fund'||!/^20\d{2}-\d{2}-\d{2}$/.test(date||''))return [];
+ const rows=[],conflicts=new Set();
+ for(const page of pages||[]){
+  for(const found of canadaLifePageTables(page,fund,date)){
+   const old=rows.find(row=>row.cls===found.cls);
+   if(!old)rows.push(found);
+   else if(old.values.MER!==found.values.MER||old.values.PTR!==found.values.PTR||old.page!==found.page)conflicts.add(found.cls);
+  }
+ }
+ return rows.filter(row=>!conflicts.has(row.cls));
+}
+
+
+function cclNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();
+}
+function identifyFundEarly_ccl(pages,profile,head){
+ const names=new Set();
+ const rx=/\b(CC&L\s+[^()]{4,130}?\bFund)\s*\(\s*the\s+[“"']?Fund[”"']?\s*\)/gi;
+ for(const page of (pages||[]).slice(0,4)){
+  const text=String(page.text||'').replace(/\s+/g,' ');let m;
+  while((m=rx.exec(text)))names.add(cclNormalize(m[1]));
+ }
+ if(names.size===1)return [...names][0];
+ if(names.size>1)return 'Unknown Fund';
+ // Cover-title fallback for future CC&L templates whose body omits the
+ // conventional '(the Fund)' definition.
+ const candidates=new Set();
+ for(const page of (pages||[]).slice(0,3)){
+  const lines=String(page.text||'').split(/\r?\n/).map(cclNormalize).filter(Boolean);
+  for(let i=0;i<lines.length;i++){
+   if(!/^CC&L\s+/i.test(lines[i]))continue;
+   let candidate=lines[i];
+   if(!/\bFund$/i.test(candidate)&&/^Fund$/i.test(lines[i+1]||''))candidate+=' Fund';
+   if(/^CC&L\s+.{4,120}\bFund$/i.test(candidate))candidates.add(candidate);
+  }
+ }
+ if(candidates.size===1)return [...candidates][0];
+ return candidates.size>1?'Unknown Fund':undefined;
+}
+function selectReportDate_ccl(pages){return reportDate(pages);}
+
+// The source PDFs contain a second, slightly offset text layer. Collapse only
+// near-identical glyph runs; different columns and repeated historical values
+// remain separate because their x positions differ.
+function cclDeduplicateItems(items){
+ const out=[];
+ for(const item of (items||[])){
+  if(typeof item.str!=='string'||!item.str.trim()||!Number.isFinite(item.x)||!Number.isFinite(item.y))continue;
+  const normalized=cclNormalize(item.str).toLowerCase();
+  const duplicate=out.find(old=>cclNormalize(old.str).toLowerCase()===normalized&&
+   Math.abs(old.x-item.x)<1.15&&Math.abs(old.y-item.y)<2.25);
+  if(!duplicate)out.push({...item,str:cclNormalize(item.str),h:Math.max(5,Number(item.h)||8),w:Math.max(0,Number(item.w)||0)});
+ }
+ return out.sort((a,b)=>b.y-a.y||a.x-b.x);
+}
+function cclBuildLines(items){
+ const lines=[];
+ for(const item of cclDeduplicateItems(items)){
+  const h=Math.max(5,Number(item.h)||8);
+  let line=lines.find(row=>Math.abs(row.y-item.y)<Math.max(1.0,Math.min(1.3,h*.15)));
+  if(!line){line={y:item.y,items:[]};lines.push(line);}
+  line.items.push(item);
+ }
+ for(const line of lines){
+  line.items.sort((a,b)=>a.x-b.x);
+  line.text=line.items.map(item=>item.str).join(' ').replace(/\s+/g,' ').trim();
+  line.minX=Math.min(...line.items.map(item=>item.x));
+  line.maxX=Math.max(...line.items.map(item=>item.x+item.w));
+ }
+ return lines.sort((a,b)=>b.y-a.y);
+}
+function cclSeriesFromLine(line){
+ const left=line.items.filter(item=>item.x<285).map(item=>item.str).join(' ');
+ const text=cclNormalize(left);
+ const match=/^(Series|Class)\s+(.+)$/i.exec(text);
+ if(!match||/\b(?:inception|date|units?|outstanding)\b/i.test(match[2]))return null;
+ const suffix=cclNormalize(match[2]).replace(/\s*\(\d+\)\s*$/,'').trim();
+ if(!suffix||suffix.length>45||/\b20\d{2}\b/.test(suffix))return null;
+ return match[1][0].toUpperCase()+match[1].slice(1).toLowerCase()+' '+suffix;
+}
+function cclParseDateLabel(value){
+ const match=/^(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\.?\s+(\d{1,2}),?$/i.exec(cclNormalize(value));
+ if(!match)return null;
+ const months={jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+ const month=months[match[1].slice(0,3).toLowerCase()];
+ return {month,day:match[2].padStart(2,'0')};
+}
+function cclCenter(item){return item.x+(Number(item.w)||0)/2;}
+function cclHeaderColumns(lines,heading){
+ const years=heading.items.filter(item=>item.x>285&&/^20\d{2}$/.test(item.str.trim()));
+ const dateItems=lines.filter(line=>line.y>heading.y+2&&line.y-heading.y<18)
+  .flatMap(line=>line.items).map(item=>({item,date:cclParseDateLabel(item.str)})).filter(x=>x.date);
+ const columns=[];
+ for(const entry of dateItems){
+  const center=cclCenter(entry.item);
+  const nearby=years.map(item=>({item,distance:Math.abs(cclCenter(item)-center)})).filter(x=>x.distance<6).sort((a,b)=>a.distance-b.distance);
+  if(nearby.length!==1)continue;
+  const year=nearby[0].item.str.trim();
+  const iso=`${year}-${entry.date.month}-${entry.date.day}`;
+  if(!columns.some(column=>column.date===iso))columns.push({date:iso,center});
+ }
+ return columns.sort((a,b)=>a.center-b.center);
+}
+function cclSelectColumn(columns,reportDate){
+ if(reportDate)return columns.find(column=>column.date===reportDate)||null;
+ return [...columns].sort((a,b)=>b.date.localeCompare(a.date))[0]||null;
+}
+function cclMetricLabel(line,key){
+ const patterns={
+  MER:/^Management\s+expense\s+ratio(?:\s*\(\d+\))?$/i,
+  TER:/^Total\s+expense\s+ratio(?:s)?(?:\s*\(\d+\))?$/i,
+  PTR:/^Portfolio\s+turnover\s+(?:rate|ratio)(?:\s*\(\d+\))?$/i
+ };
+ return line.items.find(item=>item.x<285&&patterns[key]?.test(cclNormalize(item.str)));
+}
+function cclCellTokens(item){
+ const raw=cclNormalize(item.str).replace(/\s+/g,'');
+ if(/^[—–−-]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return [{value:null,isMissing:true,raw:raw||item.str,item}];
+ const matches=[];
+ const rx=/(?:^|[^\w.])((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?%)(?=$|[^\w])/g;
+ let match;
+ while((match=rx.exec(raw))){
+  const token=match[1],value=Number(token.replace(/[,%]/g,''));
+  if(!Number.isFinite(value)||value<0||value>1000)continue;
+  const start=match.index+(match[0].length-token.length);
+  const width=(Number(item.w)||raw.length*item.h*.45)*token.length/Math.max(1,raw.length);
+  const x=item.x+(Number(item.w)||raw.length*item.h*.45)*start/Math.max(1,raw.length);
+  matches.push({value,isMissing:false,raw:token,item,box:{x:Math.max(0,x-1),y:item.y-1,w:Math.max(1,width)+2,h:item.h+2},x});
+ }
+ return matches;
+}
+function cclMetricCell(line,label,column){
+ if(!label||!column)return null;
+ const candidates=line.items.filter(item=>item.x>label.x+label.w+5).flatMap(cclCellTokens)
+  .filter(cell=>Math.abs((cell.x??cell.item.x+(cell.item.w||0)/2)-column.center)<24);
+ if(candidates.length!==1)return null;
+ const cell=candidates[0];
+ if(cell.isMissing)return {...cell,box:{x:Math.max(0,cell.item.x-1),y:cell.item.y-1,w:Math.max(2,cell.item.w)+2,h:cell.item.h+2}};
+ return cell;
+}
+function cclFindMetric(block,key){
+ // Prefer the first (uppermost) correctly labelled row in this series block.
+ // Some CC&L PDFs contain a second offset text layer; later copies can sit
+ // lower on the page and must not override the visible current table row.
+ for(const line of block){const label=cclMetricLabel(line,key);if(label)return {line,label};}
+ return null;
+}
+function cclParseFinancialPage(page,reportDate){
+ if(!Array.isArray(page.items)||!page.items.length||page.ocrUsed)return [];
+ const lines=cclBuildLines(page.items);
+ const sections=lines.filter(line=>/^Ratios\s*(?:&|and)\s*Supplemental\s+Data\s*:?$/i.test(line.text));
+ if(sections.length!==1)return [];
+ const section=sections[0];
+ const headings=lines.filter(line=>line.y<section.y&&section.y-line.y<520&&cclSeriesFromLine(line))
+  .map(line=>({line,cls:cclSeriesFromLine(line),columns:cclHeaderColumns(lines,line)}))
+  .filter(item=>cclSelectColumn(item.columns,reportDate))
+  .sort((a,b)=>b.line.y-a.line.y);
+ const out=[];
+ for(let i=0;i<headings.length;i++){
+  const current=headings[i],next=headings[i+1];
+  const block=lines.filter(line=>line.y<current.line.y-2&&(!next||line.y>next.line.y+2));
+  const columns=cclHeaderColumns(lines,current.line);
+  const column=cclSelectColumn(columns,reportDate);
+  if(!column)continue;
+  const merLine=cclFindMetric(block,'MER'),ptrLine=cclFindMetric(block,'PTR');
+  if(!merLine&&!ptrLine)continue;
+  const mer=merLine?cclMetricCell(merLine.line,merLine.label,column):null;
+  const ptr=ptrLine?cclMetricCell(ptrLine.line,ptrLine.label,column):null;
+  out.push({cls:current.cls,quality:merLine&&ptrLine?3:2,values:{MER:mer?.value??null,TER:null,PTR:ptr?.value??null},evidence:{
+   ...(merLine?{MER:{page:page.page,source:'Current-period Management Expense Ratio row',method:'native-js'}}:{}),
+   ...(ptrLine?{PTR:{page:page.page,source:'Current-period Portfolio Turnover Rate row',method:'native-js'}}:{})
+  }});
+ }
+ return out;
+}
+function extract_ccl(pages,profile,fund,date){
+ if(!fund||fund==='Unknown Fund'||!/^20\d{2}-\d{2}-\d{2}$/.test(date||''))return [];
+ const bySeries=new Map(),conflicts=new Set();
+ for(const page of pages||[]){
+  if(!/Ratios\s*(?:&|and)\s*Supplemental\s+Data/i.test(page.text||''))continue;
+  for(const row of cclParseFinancialPage(page,date)){
+   const previous=bySeries.get(row.cls);
+   if(!previous)bySeries.set(row.cls,row);
+   else if(JSON.stringify(previous.values)!==JSON.stringify(row.values))conflicts.add(row.cls);
+  }
+ }
+ for(const cls of conflicts)bySeries.delete(cls);
+ return [...bySeries.values()];
+}
+function auditRatioHeadings_ccl(pageText,potential){
+ const text=String(pageText||'');
+ const ix=text.search(/Ratios\s*(?:&|and)\s*Supplemental\s+Data/i);if(ix<0)return;
+ for(const line of text.slice(ix).split(/\r?\n/)){
+  if(/inception|date:/i.test(line))continue;
+  const prefix=/^\s*(Series|Class)\s+/i.exec(line);if(!prefix)continue;
+  // PDF.js can duplicate the heading text on the same line (for example,
+  // 'Series A Series A 2026 ...'). Stop at the first repeated heading token.
+  const beforeYear=line.split(/\s+20\d{2}\b/)[0]||'';
+  let suffix=cclNormalize(beforeYear.slice(prefix[0].length)).replace(/(?:Series|Class)\s+.*$/i,'').trim();
+  suffix=suffix.replace(/\s*\(\d+\)\s*$/,'').trim();
+  if(suffix&&suffix.length<=45)potential.add(prefix[1][0].toUpperCase()+prefix[1].slice(1).toLowerCase()+' '+suffix);
+ }
+}
+
+
+function seiNormalize(value){
+ return String(value??'').normalize('NFKC').replace(/[\u00ad\u2010-\u2015\u2212]/g,'-').replace(/\s+/g,' ').trim();
+}
+function identifyFundEarly_sei(pages){
+ const first=String(pages?.[0]?.text||'').split(/\r?\n/).map(seiNormalize).filter(Boolean);
+ if(first.length<2||!/(?:semi-annual|annual|interim)\s+management\s+report\s+of\s+fund\s+performance/i.test(first.slice(0,4).join(' ')))return undefined;
+ const title=first[0];
+ return /^[A-Z][A-Za-z0-9&'’()., /-]{3,120}\bFund$/i.test(title)?title:undefined;
+}
+function selectReportDate_sei(pages){return reportDate(pages);}
+function seiDeduplicateItems(items){
+ const out=[];
+ for(const item of items||[]){
+  if(typeof item.str!=='string'||!item.str.trim()||!Number.isFinite(item.x)||!Number.isFinite(item.y))continue;
+  const normalized=seiNormalize(item.str).toLowerCase();
+  if(out.some(old=>seiNormalize(old.str).toLowerCase()===normalized&&Math.abs(old.x-item.x)<1.15&&Math.abs(old.y-item.y)<2.25))continue;
+  out.push({...item,str:seiNormalize(item.str),h:Math.max(5,Number(item.h)||8),w:Math.max(0,Number(item.w)||0)});
+ }
+ return out.sort((a,b)=>b.y-a.y||a.x-b.x);
+}
+function seiBuildLines(items){
+ const lines=[];
+ for(const item of seiDeduplicateItems(items)){
+  let line=lines.find(row=>Math.abs(row.y-item.y)<Math.max(1.0,Math.min(1.5,item.h*.18)));
+  if(!line){line={y:item.y,items:[]};lines.push(line);}
+  line.items.push(item);
+ }
+ for(const line of lines){
+  line.items.sort((a,b)=>a.x-b.x);
+  line.text=line.items.map(item=>item.str).join(' ').replace(/\s+/g,' ').trim();
+ }
+ return lines.sort((a,b)=>b.y-a.y);
+}
+function seiClassFromLine(line){
+ const left=seiNormalize((line.items||[]).filter(item=>item.x<190).map(item=>item.str).join(' '));
+ const match=/^Class\s+([A-Za-z0-9][A-Za-z0-9 &/().-]{0,35}?)\s*\**$/i.exec(left);
+ if(!match)return null;
+ const suffix=seiNormalize(match[1]).replace(/\s+Units?$/i,'').trim();
+ if(!suffix||suffix.length>35||/\b(?:inception|date|outstanding|units?)\b/i.test(suffix))return null;
+ return 'Class '+suffix;
+}
+function seiYearItems(line){
+ return (line.items||[]).filter(item=>item.x>200&&/^20\d{2}$/.test(seiNormalize(item.str)));
+}
+function seiIsRatioHeading(line){return /^RATIOS\s+AND\s+SUPPLEMENTAL\s+DATA\s*:?$/i.test(seiNormalize(line.text));}
+function seiClassBlocks(lines,reportYear){
+ const headings=lines.map(line=>({line,cls:seiClassFromLine(line)})).filter(item=>item.cls&&item.line.items.some(it=>it.x<150));
+ const blocks=[];
+ for(let i=0;i<headings.length;i++){
+  const current=headings[i],next=headings[i+1],lower=next?.line.y??20;
+  const header=lines.filter(line=>line.y<current.line.y&&line.y>lower&&current.line.y-line.y<45&&seiYearItems(line).length>=2)
+   .sort((a,b)=>b.y-a.y)[0];
+  if(!header)continue;
+  const yearHits=seiYearItems(header).filter(item=>Number(seiNormalize(item.str))===reportYear);
+  if(yearHits.length!==1)continue;
+  const yearItem=yearHits[0],center=yearItem.x+(Number(yearItem.w)||0)/2;
+  const section=lines.filter(line=>line.y<header.y&&line.y>lower&&seiIsRatioHeading(line)).sort((a,b)=>b.y-a.y)[0];
+  if(!section)continue;
+  blocks.push({cls:current.cls,heading:current.line,next:next?.line||null,lower,header,yearItem,center,section,
+   metricLines:lines.filter(line=>line.y<section.y&&line.y>lower)});
+ }
+ return blocks;
+}
+function seiMetricLabel(line,key){
+ const patterns={
+  MER:/^Management\s+expense\s+ratio(?:\s*\([a-z0-9]{1,3}\))?$/i,
+  PTR:/^Portfolio\s+turnover\s+(?:rate|ratio)(?:\s*\([a-z0-9]{1,3}\))?$/i
+ };
+ return (line.items||[]).find(item=>item.x<250&&patterns[key]?.test(seiNormalize(item.str)));
+}
+function seiValueTokens(item){
+ const raw=seiNormalize(item.str).replace(/\s+/g,'');
+ if(/^[—–−-]{1,2}$/.test(raw)||/^n\/?a$/i.test(raw))return [{value:null,isMissing:true,raw:raw||item.str,item,x:item.x+(Number(item.w)||0)/2,box:{x:Math.max(0,item.x-1),y:item.y-1,w:Math.max(2,item.w)+2,h:item.h+2}}];
+ const out=[],rx=/(?:^|[^\w.])((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?%?)(?=$|[^\w])/g;let match;
+ while((match=rx.exec(raw))){
+  const token=match[1],value=Number(token.replace(/[,%]/g,''));
+  if(!Number.isFinite(value)||value<0||value>1000)continue;
+  const start=match.index+(match[0].length-token.length),width=(Number(item.w)||raw.length*item.h*.45)*token.length/Math.max(1,raw.length);
+  const x=item.x+(Number(item.w)||raw.length*item.h*.45)*start/Math.max(1,raw.length);
+  out.push({value,isMissing:false,raw:token,item,x:x+width/2,box:{x:Math.max(0,x-1),y:item.y-1,w:Math.max(1,width)+2,h:item.h+2}});
+ }
+ return out;
+}
+function seiMetricCell(line,label,center){
+ if(!label||!Number.isFinite(center))return null;
+ const hits=(line.items||[]).filter(item=>item.x>label.x+label.w+5).flatMap(seiValueTokens)
+  .filter(cell=>Math.abs(cell.x-center)<16);
+ if(hits.length!==1)return null;
+ return hits[0];
+}
+function seiFindMetric(block,key){
+ for(const line of block.metricLines){const label=seiMetricLabel(line,key);if(label)return {line,label};}
+ return null;
+}
+function seiParseFinancialPage(page,reportYear){
+ if(!Array.isArray(page.items)||!page.items.length||page.ocrUsed)return [];
+ const lines=seiBuildLines(page.items);
+ if(!lines.some(seiIsRatioHeading))return [];
+ const out=[];
+ for(const block of seiClassBlocks(lines,reportYear)){
+  const merLine=seiFindMetric(block,'MER'),ptrLine=seiFindMetric(block,'PTR');
+  if(!merLine&&!ptrLine)continue;
+  const mer=merLine?seiMetricCell(merLine.line,merLine.label,block.center):null;
+  const ptr=ptrLine?seiMetricCell(ptrLine.line,ptrLine.label,block.center):null;
+  out.push({cls:block.cls,quality:merLine&&ptrLine?3:2,values:{MER:mer?.value??null,TER:null,PTR:ptr?.value??null},evidence:{
+   ...(merLine?{MER:{page:page.page,source:'Latest-year Management Expense Ratio row',method:'native-js'}}:{}),
+   ...(ptrLine?{PTR:{page:page.page,source:'Latest-year Portfolio Turnover Rate row',method:'native-js'}}:{})
+  }});
+ }
+ return out;
+}
+function extract_sei(pages,profile,fund,date){
+ if(!fund||fund==='Unknown Fund'||!/^20\d{2}-\d{2}-\d{2}$/.test(date||''))return [];
+ const reportYear=Number(date.slice(0,4)),byClass=new Map(),conflicts=new Set();
+ for(const page of pages||[]){
+  if(!/Financial\s+Highlights|Ratios\s+and\s+Supplemental\s+Data/i.test(page.text||''))continue;
+  for(const row of seiParseFinancialPage(page,reportYear)){
+   const previous=byClass.get(row.cls);
+   if(!previous)byClass.set(row.cls,row);
+   else if(JSON.stringify(previous.values)!==JSON.stringify(row.values))conflicts.add(row.cls);
+  }
+ }
+ for(const cls of conflicts)byClass.delete(cls);
+ return [...byClass.values()];
+}
+function auditRatioHeadings_sei(pageText,potential){
+ const lines=String(pageText||'').split(/\r?\n/).map(seiNormalize);
+ for(let i=0;i<lines.length;i++){
+  const match=/^Class\s+([A-Za-z0-9][A-Za-z0-9 &/().-]{0,35}?)\s*\**$/i.exec(lines[i]);
+  if(!match)continue;
+  let end=lines.length;
+  for(let j=i+1;j<lines.length;j++)if(/^Class\s+[A-Za-z0-9]/i.test(lines[j])){end=j;break;}
+  if(lines.slice(i+1,end).some(line=>/^RATIOS\s+AND\s+SUPPLEMENTAL\s+DATA\s*:?$/i.test(line))){
+   const suffix=seiNormalize(match[1]).replace(/\s+Units?$/i,'').trim();
+   if(suffix)potential.add('Class '+suffix);
+  }
+ }
+}
+
+
 
 const FMC_ADAPTERS=[
-{key:"nbi",profile:nbi,extract:extract_nbi,config:fmcConfig_nbi,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:identifyFundFallback_nbi,selectReportDate:null,auditRatioHeadings:null},
+{key:"nbi",profile:nbi,extract:extract_nbi,config:fmcConfig_nbi,identifyFundEarly:identifyFundEarly_nbi,identifyFundLate:null,identifyFundFallback:identifyFundFallback_nbi,selectReportDate:null,auditRatioHeadings:null},
 {key:"desjardins",profile:desjardins,extract:extract_desjardins,config:fmcConfig_desjardins,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
 {key:"sun_life",profile:sunLife,extract:extract_sun_life,config:fmcConfig_sun_life,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
 {key:"franklin",profile:franklin,extract:extract_franklin,config:fmcConfig_franklin,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
@@ -2270,10 +3470,17 @@ const FMC_ADAPTERS=[
 {key:"rpia",profile:profile_rpia,extract:extract_rpia,config:fmcConfig_rpia,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
 {key:"leith_wheeler",profile:profile_leith_wheeler,extract:extract_leith_wheeler,config:fmcConfig_leith_wheeler,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
 {key:"ci",profile:profile_ci,extract:extract_ci,config:fmcConfig_ci,identifyFundEarly:identifyFundEarly_ci,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:auditRatioHeadings_ci},
-{key:"scotia",profile:profile_scotia,extract:extract_scotia,config:fmcConfig_scotia,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:auditRatioHeadings_scotia}
+{key:"scotia",profile:profile_scotia,extract:extract_scotia,config:fmcConfig_scotia,identifyFundEarly:null,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:auditRatioHeadings_scotia},
+{key:"capital_group",profile:profile_capital_group,extract:extract_capital_group,config:fmcConfig_capital_group,identifyFundEarly:identifyFundEarly_capital_group,identifyFundLate:null,identifyFundFallback:null,selectReportDate:selectReportDate_capital_group,auditRatioHeadings:auditRatioHeadings_capital_group},
+{key:"arrow_capital",profile:profile_arrow_capital,extract:extract_arrow_capital,config:fmcConfig_arrow_capital,identifyFundEarly:identifyFundEarly_arrow_capital,identifyFundLate:null,identifyFundFallback:null,selectReportDate:selectReportDate_arrow_capital,auditRatioHeadings:auditRatioHeadings_arrow_capital},
+{key:"guardian",profile:profile_guardian,extract:extract_guardian,config:fmcConfig_guardian,identifyFundEarly:identifyFundEarly_guardian,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:auditRatioHeadings_guardian},
+{key:"beutel_goodman",profile:profile_beutel_goodman,extract:extract_beutel_goodman,config:fmcConfig_beutel_goodman,identifyFundEarly:identifyFundEarly_beutel_goodman,identifyFundLate:null,identifyFundFallback:null,selectReportDate:selectReportDate_beutel_goodman,auditRatioHeadings:auditRatioHeadings_beutel_goodman},
+{key:"canada_life",profile:profile_canada_life,extract:extract_canada_life,config:fmcConfig_canada_life,identifyFundEarly:identifyFundEarly_canada_life,identifyFundLate:null,identifyFundFallback:null,selectReportDate:null,auditRatioHeadings:null},
+{key:"ccl",profile:profile_ccl,extract:extract_ccl,config:fmcConfig_ccl,identifyFundEarly:identifyFundEarly_ccl,identifyFundLate:null,identifyFundFallback:null,selectReportDate:selectReportDate_ccl,auditRatioHeadings:auditRatioHeadings_ccl},
+{key:"sei",profile:profile_sei,extract:extract_sei,config:fmcConfig_sei,identifyFundEarly:identifyFundEarly_sei,identifyFundLate:null,identifyFundFallback:null,selectReportDate:selectReportDate_sei,auditRatioHeadings:auditRatioHeadings_sei}
 ];
 const FMC_ADAPTERS_BY_KEY=Object.fromEntries(FMC_ADAPTERS.map(x=>[x.key,x]));
-const FMC_CLASS_HEADING_BY_STYLE=Object.fromEntries([[nbi.style,classHeading_nbi],[desjardins.style,classHeading_desjardins],[sunLife.style,classHeading_sun_life],[franklin.style,classHeading_franklin],[middlefield.style,classHeading_middlefield],[manulife.style,classHeading_manulife],[dynamic.style,classHeading_dynamic],[purpose.style,classHeading_purpose],[rbc.style,classHeading_rbc]]);
+const FMC_CLASS_HEADING_BY_STYLE=Object.fromEntries([[nbi.style,classHeading_nbi],[desjardins.style,classHeading_desjardins],[sunLife.style,classHeading_sun_life],[franklin.style,classHeading_franklin],[middlefield.style,classHeading_middlefield],[manulife.style,classHeading_manulife],[dynamic.style,classHeading_dynamic],[purpose.style,classHeading_purpose],[rbc.style,classHeading_rbc],[profile_guardian.style,classHeading_guardian],[profile_beutel_goodman.style,classHeading_beutel_goodman]]);
 const REGISTRY=FMC_ADAPTERS.map(x=>x.profile);
 /* Generated-build input: keep declaration order in dev-tools/fmc-manifest.json. */
 // Many issuers append an explanatory alias to the printed product title,
@@ -2335,7 +3542,20 @@ function analyzePages(pages,{onProgress=()=>{}}={}){
  if(adapter?.config?.renameEmptyClasses&&!parsed.some(r=>/^(?:CAD|USD) Units$/i.test(r.cls||'')))parsed.forEach(r=>{if(!r.cls)r.cls=fund;});
  if(adapter?.config?.deduplicate)parsed=[...new Map(parsed.map(x=>[x.cls,x])).values()];
  if(!parsed.length&&adapter?.config?.allowRowFallback!==false)parsed=rowTable(pages,p);
- const rows=parsed.filter(r=>r.cls&&r.quality>=2).map(r=>makeRow(r.cls,p,fund,date,r.values,r.evidence,fund==='Unknown Fund'));
+ // TER has changed meaning at the office level: the legacy adapters' TER
+ // cells are Trading Expense Ratios. Never expose them as Total Expense Ratio.
+ // Re-detect only explicitly labelled, class/year-bound TOTAL expense cells.
+ const rows=parsed.filter(r=>r.cls&&r.quality>=2).map(r=>{
+  const values={...r.values,TER:null},evidence={...r.evidence};
+  delete evidence.TER;
+  const total=totalExpenseRatioSource(pages,{class_name:r.cls,fund_name:fund,report_date:date});
+  if(total){
+   values.TER=total.value;
+   evidence.TER={page:total.page,source:'Total Expense Ratio (verified class and reporting-year column)',method:'native-js',totalExpenseValidated:true};
+  }
+  return makeRow(r.cls,p,fund,date,values,evidence,fund==='Unknown Fund',
+   r.displayCls?{displayClassName:r.displayCls,classAliases:r.aliases||[]}:null);
+ });
  const audit=ratioHeadingAudit(pages,p,parsed);
  const diagnostics=[{fmc_detection:{status:'matched',fmc_key:p.key},report_date:date,extraction_method:'native-js',fund_name:fund,fmc_label:p.label,classes:rows.length,...(audit?{series_completeness:audit}:{})},...pages.map(x=>({page:x.page,mode:x.ocrUsed?'ocr-fallback':'native-pdfjs'}))];
  return {results:rows,diagnostics,raw:[],profile:p};
